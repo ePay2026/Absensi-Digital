@@ -15,6 +15,57 @@ import ExcelJS from 'exceljs';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, AreaChart, Area, BarChart, Bar, LabelList } from 'recharts';
 import { format } from 'date-fns';
 
+export interface GeneralSettings {
+  companyName?: string;
+  headName?: string;
+  pimpinanName?: string;
+  email?: string;
+  address?: string;
+  mainLocation?: string;
+}
+
+export interface AbsensiSettings {
+  tolerance?: string;
+  enableCountdown?: boolean;
+  enableEarlyCheckout?: boolean;
+}
+
+export interface Employee {
+  id?: string;
+  nip: string;
+  name: string;
+  unit?: string;
+  office?: string;
+  office2?: string;
+}
+
+export interface Shift {
+  id?: string;
+  name: string;
+  startTime?: string;
+  endTime?: string;
+  isActive?: boolean;
+}
+
+export interface AttendanceRecord {
+  id: string;
+  nip: string;
+  name: string;
+  date: string;
+  time?: string;
+  type: string;
+  status: string;
+  shift?: string;
+  location?: unknown;
+  photoUrl?: string;
+}
+
+export interface ProcessedSession {
+  inRecord: AttendanceRecord | null;
+  outRecord: AttendanceRecord | null;
+  leaveRecord: AttendanceRecord | null;
+}
+
 export default function AdminAttendance() {
   const [searchParams, setSearchParams] = useSearchParams();
   const currentTab = searchParams.get("tab") || "harian";
@@ -23,13 +74,13 @@ export default function AdminAttendance() {
     setSearchParams({ tab: value });
   };
 
-  const [generalSettings, setGeneralSettings] = useState<any>({});
+  const [generalSettings, setGeneralSettings] = useState<GeneralSettings>({});
   const puskesmasName = generalSettings.companyName || "Puskesmas Sehat";
   const pimpinanName = generalSettings.headName || "Dr. Budi Santoso";
 
-  const [absensiSettings, setAbsensiSettings] = useState<any>({});
-  const [shifts, setShifts] = useState<any[]>([]);
-  const [employees, setEmployees] = useState<any[]>([]);
+  const [absensiSettings, setAbsensiSettings] = useState<AbsensiSettings>({});
+  const [shifts, setShifts] = useState<Shift[]>([]);
+  const [employees, setEmployees] = useState<Employee[]>([]);
 
   useEffect(() => {
     const fetchEmployees = async () => {
@@ -38,9 +89,12 @@ export default function AdminAttendance() {
         if (response.ok) {
           const data = await response.json();
           setEmployees(data);
+        } else {
+          toast.error('Gagal mengambil data karyawan');
         }
       } catch (error) {
         console.error('Failed to fetch employees:', error);
+        toast.error('Terjadi kesalahan jaringan saat mengambil data karyawan');
       }
     };
     fetchEmployees();
@@ -57,13 +111,18 @@ export default function AdminAttendance() {
           const data = await setRes.json();
           if (data.generalSettings) setGeneralSettings(data.generalSettings);
           if (data.absensiSettings) setAbsensiSettings(data.absensiSettings);
+        } else {
+           toast.error('Gagal mengambil data pengaturan');
         }
         if (shiftRes.ok) {
           const shiftData = await shiftRes.json();
           setShifts(shiftData);
+        } else {
+           toast.error('Gagal mengambil data shift');
         }
       } catch (error) {
         console.error('Failed to fetch:', error);
+        toast.error('Terjadi kesalahan jaringan saat mengambil data pengaturan/shift');
       }
     };
     fetchData();
@@ -91,18 +150,31 @@ export default function AdminAttendance() {
 
   const dates = getDatesInRange(startDate, endDate);
 
-  const [attendanceData, setAttendanceData] = useState<any[]>([]);
+  const [attendanceData, setAttendanceData] = useState<AttendanceRecord[]>([]);
 
   const fetchAttendance = async () => {
     try {
-      await fetch('/api/attendance/auto-checkout-check').catch(() => {});
-      const response = await fetch('/api/attendance');
+      try {
+        await fetch('/api/attendance/auto-checkout-check', { method: 'POST' });
+      } catch (e) {
+        if (e instanceof TypeError && e.message.includes('fetch')) {
+          // Ignore
+        } else {
+          console.error('Failed auto-checkout check', e);
+        }
+      }
+      
+      const response = await fetch(`/api/attendance?startDate=${startDate}&endDate=${endDate}`);
       if (response.ok) {
         const data = await response.json();
         setAttendanceData(data);
+      } else {
+        toast.error('Gagal mengambil data absensi');
       }
     } catch (error) {
+      if (error instanceof TypeError && error.message.includes('fetch')) return;
       console.error('Failed to fetch attendance:', error);
+      toast.error('Terjadi kesalahan jaringan saat mengambil data absensi');
     }
   };
 
@@ -177,34 +249,23 @@ export default function AdminAttendance() {
       return dateA.getTime() - dateB.getTime();
   });
 
-  const processedHarianRaw: any[] = [];
+  const processedHarianRaw: ProcessedSession[] = [];
   
   // Group by NIP first to process each person's timeline
-  const nipGroups = sortedRecords.reduce((acc: any, curr: any) => {
+  const nipGroups = sortedRecords.reduce((acc: Record<string, AttendanceRecord[]>, curr: AttendanceRecord) => {
       if (!acc[curr.nip]) acc[curr.nip] = [];
       acc[curr.nip].push(curr);
       return acc;
   }, {});
 
-  Object.values(nipGroups).forEach((records: any) => {
-      let currentSession: any = null;
+  Object.values(nipGroups).forEach((records: AttendanceRecord[]) => {
+      let currentSession: ProcessedSession | null = null;
       
-      records.forEach((record: any) => {
+      records.forEach((record: AttendanceRecord) => {
           const isLeave = ['izin', 'sakit', 'Cuti', 'dinas_luar', 'pending'].includes(record.type) || ['izin', 'Sakit', 'Cuti', 'Dinas Luar', 'pending'].includes(record.status);
           
           if (isLeave) {
-              const recDate = new Date(record.date);
-              const targetDate = new Date(todayStr);
-              recDate.setHours(0, 0, 0, 0);
-              targetDate.setHours(0, 0, 0, 0);
-              
-              let endDate = new Date(recDate);
-              if (typeof record.location === 'object' && record.location !== null && record.location.endDate) {
-                endDate = new Date(record.location.endDate);
-                endDate.setHours(0, 0, 0, 0);
-              }
-              
-              if (targetDate >= recDate && targetDate <= endDate) {
+              if (record.date === todayStr) {
                   processedHarianRaw.push({ inRecord: null, outRecord: null, leaveRecord: record });
               }
           } else if (record.type === 'in') {
@@ -238,13 +299,13 @@ export default function AdminAttendance() {
       }
   });
 
-  const processedHarian = processedHarianRaw.map((session: any) => {
+  const processedHarian = processedHarianRaw.map((session: ProcessedSession) => {
     const { inRecord, outRecord, leaveRecord } = session;
     const baseRecord = inRecord || outRecord || leaveRecord;
     if (!baseRecord) return null;
     
     const isIzin = ['izin', 'Sakit', 'Cuti', 'Dinas Luar', 'pending'].includes(baseRecord.status);
-    const locationVal = typeof baseRecord.location === 'object' && baseRecord.location !== null ? baseRecord.location.reason || baseRecord.location.address || JSON.stringify(baseRecord.location) : baseRecord.location;
+    const locationVal = typeof baseRecord.location === 'object' && baseRecord.location !== null ? (baseRecord.location as { reason?: string; address?: string }).reason || (baseRecord.location as { reason?: string; address?: string }).address || JSON.stringify(baseRecord.location) : (baseRecord.location as string);
     
     let shiftDisplay = baseRecord.shift || "-";
     if (inRecord && inRecord.time && inRecord.time !== "-") {
@@ -284,95 +345,64 @@ export default function AdminAttendance() {
 
   // Process attendance data for Bulanan
 
+  const isDateInLeaveRange = (leaveRecord: AttendanceRecord | null, checkDateStr: string) => {
+    if (!leaveRecord || (leaveRecord.type !== 'izin' && leaveRecord.type !== 'sakit' && leaveRecord.type !== 'Cuti' && leaveRecord.type !== 'dinas_luar' && leaveRecord.type !== 'pending' && !['izin', 'Sakit', 'Cuti', 'Dinas Luar', 'pending'].includes(leaveRecord.status))) return false;
+    
+    const startDate = leaveRecord.date;
+    const endDate = (leaveRecord.location as { endDate?: string })?.endDate || startDate;
+    
+    return checkDateStr >= startDate && checkDateStr <= endDate;
+  };
+
+  const getLeaveDayNumber = (leaveRecord: AttendanceRecord, checkDateStr: string) => {
+    const startObj = new Date(leaveRecord.date);
+    const checkObj = new Date(checkDateStr);
+    const diffTime = Math.abs(checkObj.getTime() - startObj.getTime());
+    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)); 
+    return diffDays + 1; // 1-indexed day (first day is day 1)
+  };
+
   const bulananData = employees.map(emp => {
     const empAttendance = attendanceData.filter(a => a.nip === emp.nip);
-    const attendanceMap: any = {};
+    const attendanceMap: Record<string, { code: string; label?: string; hours: number; color?: string; bgColor?: string; onlyIn?: boolean } | string> = {};
     let totalHoursCount = 0;
 
     dates.forEach(date => {
-      const recordsForDate = empAttendance.filter(a => a.date === date);
-      let statusInfo = { code: '-', hours: 0, onlyIn: false, bgColor: '' };
+      // Find normal IN/OUT records for the exact date
+      const exactRecords = empAttendance.filter(a => a.date === date);
       
-      const inRecord = recordsForDate.find(a => a.type === 'in');
-      let outRecord = recordsForDate.find(a => a.type === 'out');
-      const leaveRecord = empAttendance.find(a => {
-        const isLeaveType = ['izin', 'sakit', 'Cuti', 'dinas_luar', 'pending'].includes(a.type) || ['izin', 'Sakit', 'Cuti', 'Dinas Luar', 'pending'].includes(a.status);
-        if (!isLeaveType) return false;
-        
-        const recDate = new Date(a.date);
-        const targetDate = new Date(date);
-        recDate.setHours(0, 0, 0, 0);
-        targetDate.setHours(0, 0, 0, 0);
-        
-        let endDate = new Date(recDate);
-        if (typeof a.location === 'object' && a.location !== null && a.location.endDate) {
-          endDate = new Date(a.location.endDate);
-          endDate.setHours(0, 0, 0, 0);
-        }
-        
-        return targetDate >= recDate && targetDate <= endDate;
-      });
+      // Keep normal logic for IN/OUT
+      const inRecord = exactRecords.find(a => a.type === 'in');
+      let outRecord = exactRecords.find(a => a.type === 'out');
+      
+      // Find a multi-day (or single day) leave record that covers this date
+      const leaveRecord = empAttendance.find(a => isDateInLeaveRange(a, date));
+
+      let statusInfo = { code: '-', hours: 0, onlyIn: false, bgColor: '' };
 
       if (leaveRecord) {
-        // Evaluate consecutive days for 'sakit' or 'dinas_luar'
-        const isSakit = leaveRecord.status === 'Sakit' || leaveRecord.type === 'sakit';
-        const isDinasLuar = leaveRecord.status === 'Dinas Luar' || leaveRecord.type === 'dinas_luar';
-        
-        let shouldGiveHours = false;
-        if (isSakit || isDinasLuar) {
-          let consecutiveCount = 0;
-          let checkDate = new Date(date);
-          checkDate.setHours(0, 0, 0, 0);
-          
-          while (true) {
-            const hasSameLeave = empAttendance.some(a => {
-               const matchesType = (isSakit && (a.status === 'Sakit' || a.type === 'sakit')) ||
-                                   (isDinasLuar && (a.status === 'Dinas Luar' || a.type === 'dinas_luar'));
-               if (!matchesType) return false;
-               const rDate = new Date(a.date);
-               rDate.setHours(0, 0, 0, 0);
-               let eDate = new Date(rDate);
-               if (typeof a.location === 'object' && a.location !== null && a.location.endDate) {
-                 eDate = new Date(a.location.endDate);
-                 eDate.setHours(0, 0, 0, 0);
-               }
-               return checkDate >= rDate && checkDate <= eDate;
-            });
-            if (hasSameLeave) {
-               consecutiveCount++;
-               checkDate.setDate(checkDate.getDate() - 1);
-            } else {
-               break;
-            }
-          }
-          if (consecutiveCount <= 3) {
-             shouldGiveHours = true;
-          }
-        }
-
-        if (leaveRecord.status === 'pending') {
-          statusInfo.code = 'P';
-        } else if (isSakit) {
-          statusInfo.code = 'S';
-          if (shouldGiveHours) {
-            statusInfo.hours = Number((6 + 25/60).toFixed(2));
-          } else {
-            statusInfo.hours = 0;
-          }
-        } else if (isDinasLuar) {
-          statusInfo.code = 'D';
-          if (shouldGiveHours) {
-            statusInfo.hours = Number((6 + 25/60).toFixed(2));
-          } else {
-            statusInfo.hours = 0;
-          }
-        } else if (leaveRecord.status === 'Cuti' || leaveRecord.type === 'cuti' || leaveRecord.type === 'Cuti') {
-          statusInfo.code = 'C';
-        } else if (leaveRecord.status === 'izin' || leaveRecord.type === 'izin') {
+        if (leaveRecord.status === 'izin' || leaveRecord.type === 'izin') {
           statusInfo.code = 'I';
-        } else {
-          statusInfo.code = leaveRecord.status?.[0]?.toUpperCase() || 'M';
+          const dayNumber = getLeaveDayNumber(leaveRecord, date);
+          statusInfo.hours = dayNumber <= 3 ? (6 + 25/60) : 0;
         }
+        else if (leaveRecord.status === 'Sakit' || leaveRecord.type === 'sakit') {
+          statusInfo.code = 'S';
+          const dayNumber = getLeaveDayNumber(leaveRecord, date);
+          statusInfo.hours = dayNumber <= 3 ? (6 + 25/60) : 0;
+        }
+        else if (leaveRecord.status === 'Cuti' || leaveRecord.type === 'Cuti') {
+          statusInfo.code = 'C';
+          const dayNumber = getLeaveDayNumber(leaveRecord, date);
+          statusInfo.hours = dayNumber <= 3 ? (6 + 25/60) : 0;
+        }
+        else if (leaveRecord.status === 'Dinas Luar' || leaveRecord.type === 'dinas_luar') {
+          statusInfo.code = 'D';
+          const dayNumber = getLeaveDayNumber(leaveRecord, date);
+          statusInfo.hours = dayNumber <= 3 ? (6 + 25/60) : 0;
+        }
+        else if (leaveRecord.status === 'pending') statusInfo.code = 'P';
+        else statusInfo.code = leaveRecord.status?.[0] || 'M';
       } else if (inRecord) {
         statusInfo.code = 'M';
         
@@ -661,10 +691,13 @@ export default function AdminAttendance() {
         const response = await fetch('/api/holidays');
         if (response.ok) {
           const data = await response.json();
-          setHolidays(data.sort((a: any, b: any) => new Date(a.date).getTime() - new Date(b.date).getTime()));
+          setHolidays(data.sort((a: { date: string }, b: { date: string }) => new Date(a.date).getTime() - new Date(b.date).getTime()));
+        } else {
+          toast.error('Gagal mengambil data hari libur');
         }
       } catch (error) {
         console.error('Failed to fetch holidays:', error);
+        toast.error('Terjadi kesalahan jaringan saat mengambil data hari libur');
       }
     };
     fetchHolidays();
@@ -688,7 +721,7 @@ export default function AdminAttendance() {
           const refreshRes = await fetch('/api/holidays');
           if (refreshRes.ok) {
               const data = await refreshRes.json();
-              setHolidays(data.sort((a: any, b: any) => new Date(a.date).getTime() - new Date(b.date).getTime()));
+              setHolidays(data.sort((a: { date: string }, b: { date: string }) => new Date(a.date).getTime() - new Date(b.date).getTime()));
           }
           setNewHolidayDate("");
           setNewHolidayName("");
@@ -823,8 +856,7 @@ export default function AdminAttendance() {
       if (response.ok) {
         toast.success('Permintaan disetujui');
         // Refresh attendance data
-        const res = await fetch('/api/attendance');
-        if (res.ok) setAttendanceData(await res.json());
+        fetchAttendance();
       }
     } catch (error) {
       toast.error('Gagal menyetujui permintaan');
@@ -841,8 +873,7 @@ export default function AdminAttendance() {
       if (response.ok) {
         toast.success('Permintaan ditolak');
         // Refresh attendance data
-        const res = await fetch('/api/attendance');
-        if (res.ok) setAttendanceData(await res.json());
+        fetchAttendance();
       }
     } catch (error) {
       toast.error('Gagal menolak permintaan');
@@ -924,7 +955,7 @@ export default function AdminAttendance() {
         if (typeof attInfo === 'string') {
            rowData.push(attInfo || '-');
         } else if (attInfo) {
-           rowData.push((attInfo as any).code || '-');
+           rowData.push((attInfo as { code: string }).code || '-');
         } else {
            rowData.push('-');
         }
@@ -944,6 +975,7 @@ export default function AdminAttendance() {
     worksheet.getCell(lastRow + 4, 1).value = 'C = Cuti';
     worksheet.getCell(lastRow + 5, 1).value = 'S = Sakit';
     worksheet.getCell(lastRow + 6, 1).value = 'D = Dinas Luar';
+    worksheet.getCell(lastRow + 7, 1).value = 'I = Izin Pribadi';
 
     // Add Signature
     // Place signature on the right side of the table
@@ -1080,7 +1112,7 @@ export default function AdminAttendance() {
                     className="w-auto" 
                   />
                 </div>
-                <Button className="flex items-center gap-2">
+                <Button onClick={fetchAttendance} className="flex items-center gap-2">
                   <Search className="h-4 w-4" />
                   Tampilkan
                 </Button>

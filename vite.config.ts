@@ -9,7 +9,37 @@ export default defineConfig(({mode}) => {
   return {
     plugins: [
       react(),
-      tailwindcss()
+      tailwindcss(),
+      VitePWA({
+        registerType: 'autoUpdate',
+        injectRegister: 'auto',
+        workbox: {
+          maximumFileSizeToCacheInBytes: 5 * 1024 * 1024, // 5MB
+          navigateFallbackDenylist: [/^\/api/]
+        },
+        devOptions: {
+          enabled: false
+        },
+        manifest: {
+          name: 'Si Abon Elite App',
+          short_name: 'Si Abon',
+          theme_color: '#14b8a6',
+          display: 'standalone',
+          start_url: '/',
+          icons: [
+            {
+              src: '/logo.png',
+              sizes: '192x192',
+              type: 'image/png'
+            },
+            {
+              src: '/logo.png',
+              sizes: '512x512',
+              type: 'image/png'
+            }
+          ]
+        }
+      })
     ],
     define: {
       'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY),
@@ -24,5 +54,9 @@ export default defineConfig(({mode}) => {
       // Do not modifyâfile watching is disabled to prevent flickering during agent edits.
       hmr: process.env.DISABLE_HMR !== 'true',
     },
+    build: {
+      chunkSizeWarningLimit: 2000,
+    },
+    logLevel: 'error',
   };
 });
