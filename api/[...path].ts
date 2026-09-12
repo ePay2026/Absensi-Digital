@@ -25,6 +25,7 @@ function normalizeReqUrl(req: IncomingMessage): void {
       return;
     }
 
+    // Ensure it has /api prefix so Express router mounts reliably
     if (!req.url.startsWith('/api')) {
       req.url = `/api${req.url.startsWith('/') ? '' : '/'}${req.url}`;
     }
@@ -33,9 +34,7 @@ function normalizeReqUrl(req: IncomingMessage): void {
   }
 }
 
-// Vercel Serverless Function entry point
 export default function handler(req: IncomingMessage, res: ServerResponse) {
   normalizeReqUrl(req);
   return app(req as any, res as any);
 }
-

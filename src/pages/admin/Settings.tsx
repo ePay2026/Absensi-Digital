@@ -8,7 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { toast } from "sonner";
 import ExcelJS from 'exceljs';
-
+import { FileSpreadsheet, CheckCircle2, XCircle, RefreshCw, AlertCircle, ExternalLink, Database, ShieldCheck } from "lucide-react";
 import { format } from 'date-fns';
 
 export default function AdminSettings() {
@@ -49,6 +49,55 @@ export default function AdminSettings() {
   const [locations, setLocations] = useState<{ id: string; desa: string; kecamatan: string; kabupaten: string; coordinates: string; radius: number }[]>([]);
   const [isSavingLocations, setIsSavingLocations] = useState(false);
 
+  // State for Spreadsheet Diagnostic
+  const [spreadsheetStatus, setSpreadsheetStatus] = useState<{
+    connected?: boolean;
+    message?: string;
+    error?: string;
+    spreadsheetTitle?: string;
+    spreadsheetId?: string;
+    clientEmail?: string;
+    sheetCount?: number;
+    sheets?: string[];
+    sheetStats?: Record<string, { title: string; rowCount: number }>;
+    envCheck?: {
+      hasSpreadsheetId: boolean;
+      spreadsheetIdPreview: string | null;
+      hasClientEmail: boolean;
+      clientEmailPreview: string | null;
+      hasPrivateKey: boolean;
+      privateKeyLength: number;
+      privateKeyValidPEM: boolean;
+      isVercel: boolean;
+    };
+  } | null>(null);
+  const [isLoadingSpreadsheet, setIsLoadingSpreadsheet] = useState(false);
+  const [isTestingSpreadsheet, setIsTestingSpreadsheet] = useState(false);
+
+  const fetchSpreadsheetStatus = async (testFresh = false) => {
+    if (testFresh) setIsTestingSpreadsheet(true);
+    else setIsLoadingSpreadsheet(true);
+    try {
+      const endpoint = testFresh ? '/api/spreadsheet-status?test=true' : '/api/spreadsheet-status';
+      const res = await fetch(endpoint);
+      const data = await res.json();
+      setSpreadsheetStatus(data);
+      if (testFresh) {
+        if (data.connected) {
+          toast.success("Berhasil terhubung ke Google Spreadsheet!");
+        } else {
+          toast.error(data.message || "Gagal terhubung ke Google Spreadsheet");
+        }
+      }
+    } catch (err) {
+      console.error('Failed to fetch spreadsheet status:', err);
+      if (testFresh) toast.error("Gagal menghubungi server untuk cek spreadsheet");
+    } finally {
+      setIsLoadingSpreadsheet(false);
+      setIsTestingSpreadsheet(false);
+    }
+  };
+
   // Load from API on mount
   useEffect(() => {
     const fetchSettings = async () => {
@@ -78,6 +127,7 @@ export default function AdminSettings() {
       }
     };
     fetchSettings();
+    fetchSpreadsheetStatus(false);
   }, []);
 
   const handleGeneralChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -174,6 +224,18 @@ export default function AdminSettings() {
       </div>
 
       <Tabs value={currentTab} onValueChange={handleTabChange} className="space-y-4">
+        <TabsList className="grid grid-cols-2 md:grid-cols-6 h-auto p-1 bg-slate-100 dark:bg-slate-800">
+          <TabsTrigger value="general" className="text-xs sm:text-sm py-2">Umum</TabsTrigger>
+          <TabsTrigger value="absensi" className="text-xs sm:text-sm py-2">Absensi</TabsTrigger>
+          <TabsTrigger value="leave" className="text-xs sm:text-sm py-2">Izin & Cuti</TabsTrigger>
+          <TabsTrigger value="lokasi" className="text-xs sm:text-sm py-2">Lokasi</TabsTrigger>
+          <TabsTrigger value="data" className="text-xs sm:text-sm py-2">Manajemen Data</TabsTrigger>
+          <TabsTrigger value="spreadsheet" className="text-xs sm:text-sm py-2 flex items-center justify-center gap-1.5">
+            <span>Spreadsheet</span>
+            <span className={`h-2 w-2 rounded-full ${spreadsheetStatus?.connected ? 'bg-emerald-500' : 'bg-rose-500'}`} />
+          </TabsTrigger>
+        </TabsList>
+
         <TabsContent value="general">
           <Card>
             <CardHeader>
@@ -412,6 +474,159 @@ export default function AdminSettings() {
               <div className="flex gap-4">
                 <Button variant="outline" onClick={handleExportUsers}>Export Data User (Excel)</Button>
                 <Button variant="outline" onClick={handleExportAbsensi}>Export Data Absensi (Excel)</Button>
+              </div>
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        <TabsContent value="spreadsheet">
+          <Card>
+            <CardHeader className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4">
+              <div>
+                <CardTitle className="flex items-center gap-2 text-xl font-bold">
+                  <FileSpreadsheet className="h-6 w-6 text-emerald-600" />
+                  Status Koneksi Google Spreadsheet
+                </CardTitle>
+                <CardDescription>
+                  Pemantauan status integrasi Google Spreadsheet untuk absensi dan master data
+                </CardDescription>
+              </div>
+              <Button 
+                variant="outline" 
+                size="sm" 
+                onClick={() => fetchSpreadsheetStatus(true)} 
+                disabled={isTestingSpreadsheet}
+                className="flex items-center gap-2 shrink-0 self-start sm:self-auto"
+              >
+                <RefreshCw className={`h-4 w-4 ${isTestingSpreadsheet ? 'animate-spin' : ''}`} />
+                {isTestingSpreadsheet ? "Menguji Koneksi..." : "Uji & Refresh Koneksi"}
+              </Button>
+            </CardHeader>
+            <CardContent className="space-y-6">
+              {/* Connection Status Banner */}
+              <div className={`p-4 rounded-xl border flex items-start gap-4 ${
+                spreadsheetStatus?.connected 
+                  ? 'bg-emerald-50/70 border-emerald-200 dark:bg-emerald-950/20 dark:border-emerald-800' 
+                  : 'bg-rose-50/70 border-rose-200 dark:bg-rose-950/20 dark:border-rose-800'
+              }`}>
+                {spreadsheetStatus?.connected ? (
+                  <CheckCircle2 className="h-6 w-6 text-emerald-600 shrink-0 mt-0.5" />
+                ) : (
+                  <XCircle className="h-6 w-6 text-rose-600 shrink-0 mt-0.5" />
+                )}
+                <div className="flex-1 space-y-1">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <h3 className={`font-semibold text-base ${spreadsheetStatus?.connected ? 'text-emerald-900 dark:text-emerald-200' : 'text-rose-900 dark:text-rose-200'}`}>
+                      {spreadsheetStatus?.connected ? 'Terhubung Aktif ke Google Spreadsheet' : 'Belum Terhubung ke Google Spreadsheet'}
+                    </h3>
+                    <span className={`text-xs px-2.5 py-0.5 rounded-full font-medium ${
+                      spreadsheetStatus?.connected 
+                        ? 'bg-emerald-200 text-emerald-800 dark:bg-emerald-900 dark:text-emerald-200' 
+                        : 'bg-rose-200 text-rose-800 dark:bg-rose-900 dark:text-rose-200'
+                    }`}>
+                      {spreadsheetStatus?.connected ? 'ONLINE SPREADSHEET' : 'FALLBACK LOCAL DB'}
+                    </span>
+                  </div>
+                  <p className="text-sm text-slate-600 dark:text-slate-400">
+                    {spreadsheetStatus?.connected 
+                      ? `Dokumen Spreadsheet: "${spreadsheetStatus.spreadsheetTitle}" (${spreadsheetStatus.sheetCount || 0} sheet terdeteksi)`
+                      : (spreadsheetStatus?.error || 'Aplikasi sedang berjalan dengan database internal sementara.')}
+                  </p>
+                </div>
+              </div>
+
+              {/* Environment Checklist */}
+              <div className="space-y-3">
+                <h4 className="font-semibold text-sm text-slate-800 dark:text-slate-200 flex items-center gap-2">
+                  <ShieldCheck className="h-4 w-4 text-emerald-600" />
+                  Pemeriksaan Konfigurasi Server (Environment Variables)
+                </h4>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                  <div className="p-3 rounded-lg border bg-slate-50 dark:bg-slate-900 space-y-1">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-mono text-slate-500">SPREADSHEET_ID</span>
+                      {spreadsheetStatus?.envCheck?.hasSpreadsheetId ? (
+                        <CheckCircle2 className="h-4 w-4 text-emerald-600" />
+                      ) : (
+                        <XCircle className="h-4 w-4 text-rose-600" />
+                      )}
+                    </div>
+                    <p className="text-xs font-medium truncate text-slate-700 dark:text-slate-300">
+                      {spreadsheetStatus?.envCheck?.spreadsheetIdPreview || 'Belum diatur'}
+                    </p>
+                  </div>
+
+                  <div className="p-3 rounded-lg border bg-slate-50 dark:bg-slate-900 space-y-1">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-mono text-slate-500">SERVICE_ACCOUNT_EMAIL</span>
+                      {spreadsheetStatus?.envCheck?.hasClientEmail ? (
+                        <CheckCircle2 className="h-4 w-4 text-emerald-600" />
+                      ) : (
+                        <XCircle className="h-4 w-4 text-rose-600" />
+                      )}
+                    </div>
+                    <p className="text-xs font-medium truncate text-slate-700 dark:text-slate-300">
+                      {spreadsheetStatus?.envCheck?.clientEmailPreview || 'Belum diatur'}
+                    </p>
+                  </div>
+
+                  <div className="p-3 rounded-lg border bg-slate-50 dark:bg-slate-900 space-y-1">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-mono text-slate-500">GOOGLE_PRIVATE_KEY</span>
+                      {spreadsheetStatus?.envCheck?.privateKeyValidPEM ? (
+                        <CheckCircle2 className="h-4 w-4 text-emerald-600" />
+                      ) : (
+                        <XCircle className="h-4 w-4 text-rose-600" />
+                      )}
+                    </div>
+                    <p className="text-xs font-medium text-slate-700 dark:text-slate-300">
+                      {spreadsheetStatus?.envCheck?.hasPrivateKey 
+                        ? (spreadsheetStatus?.envCheck?.privateKeyValidPEM ? 'Format RSA PEM Valid' : 'Format Key Belum Sesuai') 
+                        : 'Belum diatur'}
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              {/* Sheet Details if connected */}
+              {spreadsheetStatus?.connected && spreadsheetStatus.sheets && (
+                <div className="space-y-3">
+                  <h4 className="font-semibold text-sm text-slate-800 dark:text-slate-200 flex items-center gap-2">
+                    <Database className="h-4 w-4 text-emerald-600" />
+                    Sheet Terhubung di Spreadsheet
+                  </h4>
+                  <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2">
+                    {spreadsheetStatus.sheets.map((sheetName) => (
+                      <div key={sheetName} className="p-2.5 rounded-lg border bg-white dark:bg-slate-900 flex items-center justify-between text-xs">
+                        <span className="font-medium text-slate-700 dark:text-slate-300">{sheetName}</span>
+                        <span className="text-slate-400 font-mono">
+                          {spreadsheetStatus.sheetStats?.[sheetName]?.rowCount ? `${spreadsheetStatus.sheetStats[sheetName].rowCount} baris` : 'Aktif'}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Troubleshooting Guide */}
+              <div className="p-4 rounded-lg bg-amber-50/50 border border-amber-200 dark:bg-amber-950/20 dark:border-amber-800 space-y-2">
+                <h4 className="text-xs font-bold text-amber-900 dark:text-amber-300 flex items-center gap-1.5">
+                  <AlertCircle className="h-4 w-4" />
+                  Langkah Memastikan Akses Google Spreadsheet:
+                </h4>
+                <ol className="text-xs text-amber-800 dark:text-amber-400 space-y-1.5 list-decimal list-inside">
+                  <li>Buka spreadsheet Anda di Google Drive.</li>
+                  <li>Klik tombol <strong>Bagikan (Share)</strong> di kanan atas spreadsheet.</li>
+                  <li>Tambahkan email Service Account berikut:
+                    <div className="my-1">
+                      <code className="bg-amber-100 dark:bg-amber-900 text-amber-950 dark:text-amber-200 px-2 py-1 rounded text-[11px] font-mono select-all inline-block">
+                        {spreadsheetStatus?.clientEmail || spreadsheetStatus?.envCheck?.clientEmailPreview || 'service-account@...iam.gserviceaccount.com'}
+                      </code>
+                    </div>
+                  </li>
+                  <li>Pilih peran sebagai <strong>Editor</strong> (bukan Pelihat/Viewer) dan hilangkan centang "Beritahu orang".</li>
+                  <li>Klik tombol <strong>"Uji & Refresh Koneksi"</strong> di pojok kanan atas untuk memverifikasi.</li>
+                </ol>
               </div>
             </CardContent>
           </Card>

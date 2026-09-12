@@ -7,21 +7,85 @@ import { JWT } from 'google-auth-library';
 import { Resend } from 'resend';
 
 // Helper to sanitize and format Google private key for Vercel and container environments
-function formatPrivateKey(rawKey?: string): string {
+export function formatPrivateKey(rawKey?: string): string {
   if (!rawKey) return '';
   let key = rawKey.trim();
-  // Strip enclosing quotes if added in Vercel UI
-  if ((key.startsWith('"') && key.endsWith('"')) || (key.startsWith("'") && key.endsWith("'"))) {
-    key = key.slice(1, -1);
+
+  // If user accidentally pasted the whole service account JSON
+  if (key.startsWith('{') && key.endsWith('}')) {
+    try {
+      const parsed = JSON.parse(key);
+      if (parsed.private_key) {
+        key = parsed.private_key;
+      }
+    } catch (e) {}
   }
-  // Replace escaped newlines
-  key = key.replace(/\\\\n/g, '\n').replace(/\\n/g, '\n');
-  if (!key.includes('\n') && key.includes('-----BEGIN PRIVATE KEY-----')) {
-    key = key
-      .replace('-----BEGIN PRIVATE KEY-----', '-----BEGIN PRIVATE KEY-----\n')
-      .replace('-----END PRIVATE KEY-----', '\n-----END PRIVATE KEY-----\n');
+
+  // Strip enclosing quotes (single, double, or backticks, even if multiple)
+  while (
+    (key.startsWith('"') && key.endsWith('"')) ||
+    (key.startsWith("'") && key.endsWith("'")) ||
+    (key.startsWith('`') && key.endsWith('`'))
+  ) {
+    key = key.slice(1, -1).trim();
   }
+
+  // Replace literal escaped backslash-n or carriage returns
+  key = key.replace(/\\\\r\\\\n/g, '\n').replace(/\\\\n/g, '\n');
+  key = key.replace(/\\r\\n/g, '\n').replace(/\\n/g, '\n');
+  key = key.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+
+  // Handle case where BEGIN/END tags are missing newlines
+  if (key.includes('-----BEGIN PRIVATE KEY-----')) {
+    const beginMarker = '-----BEGIN PRIVATE KEY-----';
+    const endMarker = '-----END PRIVATE KEY-----';
+    const beginIdx = key.indexOf(beginMarker);
+    const endIdx = key.indexOf(endMarker);
+    if (beginIdx !== -1 && endIdx !== -1) {
+      const header = beginMarker;
+      const footer = endMarker;
+      let body = key.substring(beginIdx + beginMarker.length, endIdx).trim();
+      body = body.replace(/ /g, '\n').replace(/\n+/g, '\n');
+      key = header + '\n' + body + '\n' + footer + '\n';
+    }
+  }
+
   return key;
+}
+
+export function getServiceAccountEmail(): string {
+  let email = (process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL || '').trim();
+  if (email.startsWith('{') && email.endsWith('}')) {
+    try {
+      const parsed = JSON.parse(email);
+      if (parsed.client_email) return parsed.client_email.trim();
+    } catch (e) {}
+  }
+  while ((email.startsWith('"') && email.endsWith('"')) || (email.startsWith("'") && email.endsWith("'"))) {
+    email = email.slice(1, -1).trim();
+  }
+  if (!email && process.env.GOOGLE_PRIVATE_KEY) {
+    try {
+      const raw = process.env.GOOGLE_PRIVATE_KEY.trim();
+      if (raw.startsWith('{') && raw.endsWith('}')) {
+        const parsed = JSON.parse(raw);
+        if (parsed.client_email) return parsed.client_email.trim();
+      }
+    } catch (e) {}
+  }
+  return email;
+}
+
+export function getSpreadsheetId(): string {
+  let id = (process.env.SPREADSHEET_ID || '').trim();
+  while ((id.startsWith('"') && id.endsWith('"')) || (id.startsWith("'") && id.endsWith("'"))) {
+    id = id.slice(1, -1).trim();
+  }
+  const match = id.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+  if (match && match[1]) {
+    return match[1];
+  }
+  return id;
 }
 
 // Resend Email client getter (lazy evaluation for serverless)
@@ -116,22 +180,67 @@ function persistFallbackDB(): void {
 // Google Spreadsheet connection management (Serverless-optimized with singleton memoization)
 let docInstance: GoogleSpreadsheet | null = null;
 let docInitPromise: Promise<GoogleSpreadsheet | null> | null = null;
+let lastSpreadsheetError: string | null = null;
+let lastSpreadsheetSuccessTime: number = 0;
+const syncedSheets = new Set<string>();
 
-export async function getGoogleDoc(): Promise<GoogleSpreadsheet | null> {
-  if (docInstance) return docInstance;
-  if (docInitPromise) return docInitPromise;
+async function seedInitialAdminIfNeeded(doc: GoogleSpreadsheet) {
+  try {
+    let sheet = doc.sheetsByTitle['Admins'];
+    if (!sheet) {
+      sheet = await doc.addSheet({
+        title: 'Admins',
+        headerValues: ['id', 'name', 'nip', 'email', 'phone', 'group', 'isActive', 'access', 'password']
+      });
+    }
+    await sheet.loadHeaderRow();
+    const rows = await sheet.getRows();
+    if (rows.length === 0) {
+      console.log('Seeding initial Superadmin to Google Spreadsheet Admins sheet...');
+      await sheet.addRow({
+        id: '1',
+        name: 'Admin User',
+        nip: '123456',
+        email: 'admin@puskesmas.com',
+        phone: '08123456789',
+        group: 'Superadmin',
+        isActive: 'true',
+        access: JSON.stringify(['Dashboard', 'Absensi', 'Master Data', 'Sistem']),
+        password: 'password'
+      });
+      console.log('Initial Superadmin seeded successfully to Google Spreadsheet');
+    }
+  } catch (e) {
+    console.warn('Auto-seed admin warning:', e);
+  }
+}
 
-  const spreadsheetId = process.env.SPREADSHEET_ID;
-  const clientEmail = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
+export async function getGoogleDoc(forceFresh = false): Promise<GoogleSpreadsheet | null> {
+  if (forceFresh) {
+    docInstance = null;
+    docInitPromise = null;
+    syncedSheets.clear();
+  } else {
+    if (docInstance) return docInstance;
+    if (docInitPromise) return docInitPromise;
+  }
+
+  const spreadsheetId = getSpreadsheetId();
+  const clientEmail = getServiceAccountEmail();
   const privateKey = formatPrivateKey(process.env.GOOGLE_PRIVATE_KEY);
 
   if (!spreadsheetId || !clientEmail || !privateKey) {
+    const missing: string[] = [];
+    if (!spreadsheetId) missing.push('SPREADSHEET_ID');
+    if (!clientEmail) missing.push('GOOGLE_SERVICE_ACCOUNT_EMAIL');
+    if (!privateKey) missing.push('GOOGLE_PRIVATE_KEY');
+    lastSpreadsheetError = `Variabel lingkungan belum lengkap: ${missing.join(', ')}`;
     return null;
   }
 
   docInitPromise = (async () => {
     try {
-      console.log('Connecting to Google Sheets...');
+      console.log(`Connecting to Google Sheets ID: ${spreadsheetId.substring(0, 8)}... with service email: ${clientEmail}`);
       const serviceAccountAuth = new JWT({
         email: clientEmail,
         key: privateKey,
@@ -141,9 +250,19 @@ export async function getGoogleDoc(): Promise<GoogleSpreadsheet | null> {
       await spreadsheet.loadInfo();
       console.log('Google Spreadsheet connected successfully:', spreadsheet.title);
       docInstance = spreadsheet;
+      lastSpreadsheetSuccessTime = Date.now();
+      lastSpreadsheetError = null;
+
+      // Seed initial admin if Admins sheet is empty
+      seedInitialAdminIfNeeded(spreadsheet).catch(err => {
+        console.warn('Initial admin seed task:', err);
+      });
+
       return docInstance;
     } catch (error) {
-      console.error('Failed to connect to Google Spreadsheet:', error);
+      const errMsg = error instanceof Error ? error.message : String(error);
+      console.error('Failed to connect to Google Spreadsheet:', errMsg);
+      lastSpreadsheetError = errMsg;
       docInstance = null;
       return null;
     } finally {
@@ -154,17 +273,16 @@ export async function getGoogleDoc(): Promise<GoogleSpreadsheet | null> {
   return docInitPromise;
 }
 
-// In-Memory cache for read performance
+// In-Memory cache for read performance (15-second TTL for fast updates)
 const cache: { [key: string]: { data: any; timestamp: number } } = {};
 const inFlightRequests: { [key: string]: Promise<any> } = {};
-const CACHE_DURATION = 3 * 60 * 1000; // 3 minutes cache
-const syncedSheets = new Set<string>();
+const CACHE_DURATION = 15 * 1000; // 15 seconds cache
 
-async function getCachedData(key: string, fetchFn: () => Promise<any>) {
-  if (cache[key] && Date.now() - cache[key].timestamp < CACHE_DURATION) {
+async function getCachedData(key: string, fetchFn: () => Promise<any>, bypassCache = false) {
+  if (!bypassCache && cache[key] && Date.now() - cache[key].timestamp < CACHE_DURATION) {
     return cache[key].data;
   }
-  if (inFlightRequests[key]) {
+  if (!bypassCache && inFlightRequests[key]) {
     return inFlightRequests[key];
   }
   const promise = fetchFn()
@@ -251,8 +369,86 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 // ----------------------------------------------------
 
 // --- Health Check ---
-apiRouter.get('/healthz', (_req: Request, res: Response) => {
-  res.status(200).json({ status: 'ok', timestamp: Date.now(), vercel: isVercel });
+apiRouter.get('/healthz', async (_req: Request, res: Response) => {
+  const doc = await getGoogleDoc();
+  res.status(200).json({
+    status: 'ok',
+    timestamp: Date.now(),
+    vercel: isVercel,
+    spreadsheetConnected: !!doc,
+    spreadsheetTitle: doc?.title || null
+  });
+});
+
+// --- Google Spreadsheet Diagnostic & Connection Test ---
+apiRouter.get('/spreadsheet-status', async (req: Request, res: Response) => {
+  const forceFresh = req.query.test === 'true';
+  const doc = await getGoogleDoc(forceFresh);
+  const spreadsheetId = getSpreadsheetId();
+  const clientEmail = getServiceAccountEmail();
+  const rawKey = process.env.GOOGLE_PRIVATE_KEY || '';
+  const formattedKey = formatPrivateKey(rawKey);
+
+  const envCheck = {
+    hasSpreadsheetId: !!spreadsheetId,
+    spreadsheetIdPreview: spreadsheetId ? `${spreadsheetId.substring(0, 8)}...${spreadsheetId.substring(Math.max(0, spreadsheetId.length - 6))}` : null,
+    hasClientEmail: !!clientEmail,
+    clientEmailPreview: clientEmail || null,
+    hasPrivateKey: !!rawKey,
+    privateKeyLength: rawKey.length,
+    privateKeyValidPEM: formattedKey.includes('-----BEGIN PRIVATE KEY-----') && formattedKey.includes('-----END PRIVATE KEY-----'),
+    isVercel
+  };
+
+  if (!doc) {
+    return res.json({
+      connected: false,
+      message: 'Belum dapat terhubung ke Google Spreadsheet',
+      error: lastSpreadsheetError || 'Koneksi gagal. Pastikan email service account sudah diberi akses Editor di Google Sheets dan private key valid.',
+      envCheck
+    });
+  }
+
+  const sheetStats: Record<string, { title: string; rowCount: number }> = {};
+  for (const [title, sheet] of Object.entries(doc.sheetsByTitle)) {
+    sheetStats[title] = {
+      title,
+      rowCount: sheet.rowCount
+    };
+  }
+
+  res.json({
+    connected: true,
+    message: 'Berhasil terhubung ke Google Spreadsheet',
+    spreadsheetTitle: doc.title,
+    spreadsheetId,
+    clientEmail,
+    lastConnected: lastSpreadsheetSuccessTime,
+    sheetCount: Object.keys(doc.sheetsByTitle).length,
+    sheets: Object.keys(doc.sheetsByTitle),
+    sheetStats,
+    envCheck
+  });
+});
+
+apiRouter.post('/spreadsheet-status', async (_req: Request, res: Response) => {
+  // Clear all in-memory caches
+  Object.keys(cache).forEach(k => delete cache[k]);
+  const doc = await getGoogleDoc(true);
+  if (!doc) {
+    return res.status(500).json({
+      connected: false,
+      message: 'Gagal menghubungkan ke Google Spreadsheet',
+      error: lastSpreadsheetError
+    });
+  }
+  return res.json({
+    connected: true,
+    message: `Koneksi berhasil diverifikasi! Tersambung ke Google Spreadsheet "${doc.title}"`,
+    spreadsheetTitle: doc.title,
+    sheetCount: Object.keys(doc.sheetsByTitle).length,
+    sheets: Object.keys(doc.sheetsByTitle)
+  });
 });
 
 // --- Server Time Sync ---
@@ -261,8 +457,9 @@ apiRouter.get('/time', (_req: Request, res: Response) => {
 });
 
 // --- Employees API ---
-apiRouter.get('/employees', async (_req: Request, res: Response) => {
-  const doc = await getGoogleDoc();
+apiRouter.get('/employees', async (req: Request, res: Response) => {
+  const forceFresh = req.query.fresh === 'true';
+  const doc = await getGoogleDoc(forceFresh);
   if (doc) {
     try {
       const employees = await getCachedData('employees', async () => {
@@ -285,7 +482,7 @@ apiRouter.get('/employees', async (_req: Request, res: Response) => {
           }));
         }
         return [];
-      });
+      }, forceFresh);
       return res.json(employees);
     } catch (error) {
       console.error('Error fetching employees from spreadsheet:', error);
@@ -434,11 +631,12 @@ apiRouter.post('/employees/photo', async (req: Request, res: Response) => {
 });
 
 // --- Admins API ---
-apiRouter.get('/admins', async (_req: Request, res: Response) => {
-  const doc = await getGoogleDoc();
+apiRouter.get('/admins', async (req: Request, res: Response) => {
+  const forceFresh = req.query.fresh === 'true';
+  const doc = await getGoogleDoc(forceFresh);
   if (doc) {
     try {
-      const admins = await getCachedData('admins', async () => {
+      let admins = await getCachedData('admins', async () => {
         const sheet = await getOrCreateSheet('Admins', ['id', 'name', 'nip', 'email', 'phone', 'group', 'isActive', 'access', 'password']);
         if (sheet) {
           const rows = await sheet.getRows();
@@ -455,7 +653,32 @@ apiRouter.get('/admins', async (_req: Request, res: Response) => {
           }));
         }
         return [];
-      });
+      }, forceFresh);
+
+      if (admins.length === 0) {
+        const sheet = await getSheet('Admins');
+        if (sheet) {
+          const defaultAdmin = {
+            id: '1',
+            name: 'Admin User',
+            nip: '123456',
+            email: 'admin@puskesmas.com',
+            phone: '08123456789',
+            group: 'Superadmin',
+            isActive: 'true',
+            access: JSON.stringify(['Dashboard', 'Absensi', 'Master Data', 'Sistem']),
+            password: 'password'
+          };
+          await sheet.addRow(defaultAdmin);
+          delete cache['admins'];
+          admins = [{
+            ...defaultAdmin,
+            isActive: true,
+            access: ['Dashboard', 'Absensi', 'Master Data', 'Sistem']
+          }];
+        }
+      }
+
       return res.json(admins);
     } catch (error) {
       console.error('Error fetching admins from spreadsheet:', error);
@@ -591,11 +814,37 @@ apiRouter.post('/login', async (req: Request, res: Response) => {
             group: row.get('group'),
             access
           };
-          console.log('Admin authenticated:', user.name);
+          console.log('Admin authenticated from Admins sheet:', user.name);
         }
       }
 
-      // 2. Check Users
+      // 2. Check Employees (Official Employees directory)
+      if (!user) {
+        const empSheet = await getSheet('Employees');
+        if (empSheet) {
+          const rows = await empSheet.getRows();
+          const row = rows.find(r =>
+            String(r.get('nip') || '').trim() === nip &&
+            String(r.get('password') || '').trim() === password
+          );
+          if (row) {
+            user = {
+              id: row.get('id'),
+              nip: String(row.get('nip') || '').trim(),
+              name: row.get('name'),
+              role: 'user',
+              office: row.get('office'),
+              office2: row.get('office2') || '',
+              unit: row.get('unit') || '',
+              gender: row.get('gender') || '',
+              cluster: row.get('cluster') || ''
+            };
+            console.log('Employee authenticated from Employees sheet:', user.name);
+          }
+        }
+      }
+
+      // 3. Check Users
       if (!user) {
         const userSheet = await getSheet('Users');
         if (userSheet) {
@@ -611,10 +860,10 @@ apiRouter.post('/login', async (req: Request, res: Response) => {
               name: row.get('name'),
               role: row.get('role') || 'user',
               office: row.get('office'),
-              office2: row.get('office2'),
+              office2: row.get('office2') || '',
               unit: row.get('unit') || ''
             };
-            console.log('User authenticated:', user.name);
+            console.log('User authenticated from Users sheet:', user.name);
           }
         }
       }
@@ -679,32 +928,47 @@ apiRouter.post('/change-password', async (req: Request, res: Response) => {
   const doc = await getGoogleDoc();
   if (doc) {
     try {
-      const sheetName = role === 'admin' ? 'Admins' : 'Users';
-      const sheet = await getSheet(sheetName);
-      let userNip = null;
-      if (sheet) {
-        const rows = await sheet.getRows();
-        const userRow = rows.find(r => String(r.get('id')) === String(id) && String(r.get('password')) === String(oldPassword));
-        if (userRow) {
-          userRow.set('password', newPassword);
-          await userRow.save();
-          passwordUpdated = true;
-          userNip = userRow.get('nip');
-
-          if (role !== 'admin' && userNip) {
-            const empSheet = await getSheet('Employees');
-            if (empSheet) {
-              const empRows = await empSheet.getRows();
-              const empRow = empRows.find(r => r.get('nip') === userNip);
-              if (empRow) {
-                empRow.set('password', newPassword);
-                await empRow.save();
-              }
-            }
+      if (role === 'admin') {
+        const sheet = await getSheet('Admins');
+        if (sheet) {
+          const rows = await sheet.getRows();
+          const userRow = rows.find(r => String(r.get('id')) === String(id) && String(r.get('password')) === String(oldPassword));
+          if (userRow) {
+            userRow.set('password', newPassword);
+            await userRow.save();
+            delete cache['admins'];
+            return res.json({ success: true, message: 'Password admin berhasil diubah' });
+          } else {
+            return res.status(400).json({ success: false, message: 'Password lama salah' });
           }
+        }
+      } else {
+        const empSheet = await getSheet('Employees');
+        let empUpdated = false;
+        if (empSheet) {
+          const empRows = await empSheet.getRows();
+          const empRow = empRows.find(r => (String(r.get('id')) === String(id) || String(r.get('nip')) === String(id)) && String(r.get('password')) === String(oldPassword));
+          if (empRow) {
+            empRow.set('password', newPassword);
+            await empRow.save();
+            empUpdated = true;
+            delete cache['employees'];
+          }
+        }
+
+        const userSheet = await getSheet('Users');
+        if (userSheet) {
+          const userRows = await userSheet.getRows();
+          const userRow = userRows.find(r => (String(r.get('id')) === String(id) || String(r.get('nip')) === String(id)) && String(r.get('password')) === String(oldPassword));
+          if (userRow) {
+            userRow.set('password', newPassword);
+            await userRow.save();
+            empUpdated = true;
+          }
+        }
+
+        if (empUpdated) {
           return res.json({ success: true, message: 'Password berhasil diubah' });
-        } else {
-          return res.status(400).json({ success: false, message: 'Password lama salah' });
         }
       }
     } catch (error) {
@@ -1981,7 +2245,11 @@ apiRouter.post('/settings', async (req: Request, res: Response) => {
       if (sheet) {
         const rows = await sheet.getRows();
         const existingRow = rows.find(r => r.get('key') === key);
-        const stringifiedValue = JSON.stringify(value);
+        let stringifiedValue = JSON.stringify(value);
+        if (stringifiedValue.length > 45000) {
+          console.warn(`Settings value for ${key} is very large (${stringifiedValue.length} chars). Truncating for Google Sheets cell safety.`);
+          stringifiedValue = stringifiedValue.substring(0, 45000);
+        }
 
         if (existingRow) {
           existingRow.set('value', stringifiedValue);

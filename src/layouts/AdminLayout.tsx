@@ -1,5 +1,5 @@
 import { Outlet, Link, useLocation, useNavigate } from 'react-router-dom';
-import { Activity, LayoutDashboard, Users, Clock, Settings, LogOut, Menu, ChevronDown } from 'lucide-react';
+import { Activity, LayoutDashboard, Users, Clock, Settings, LogOut, Menu, ChevronDown, FileSpreadsheet } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useState, useEffect } from 'react';
 import { ThemeToggle } from '../components/ThemeToggle';
@@ -214,6 +214,10 @@ export default function AdminLayout() {
                       <DropdownMenuItem render={<Link to="/admin/settings?tab=data" className="w-full cursor-pointer" />}>
                         Manajemen Data
                       </DropdownMenuItem>
+                      <DropdownMenuItem render={<Link to="/admin/settings?tab=spreadsheet" className="w-full cursor-pointer flex items-center justify-between" />}>
+                        <span>Koneksi Spreadsheet</span>
+                        <FileSpreadsheet className="h-3.5 w-3.5 text-emerald-600" />
+                      </DropdownMenuItem>
                     </DropdownMenuContent>
                   </DropdownMenu>
                 )}
@@ -278,6 +282,7 @@ export default function AdminLayout() {
                         <DropdownMenuItem render={<Link to="/admin/settings?tab=leave" className="w-full cursor-pointer pl-6" />}>Izin & Cuti</DropdownMenuItem>
                         <DropdownMenuItem render={<Link to="/admin/settings?tab=lokasi" className="w-full cursor-pointer pl-6" />}>Lokasi</DropdownMenuItem>
                         <DropdownMenuItem render={<Link to="/admin/settings?tab=data" className="w-full cursor-pointer pl-6" />}>Manajemen Data</DropdownMenuItem>
+                        <DropdownMenuItem render={<Link to="/admin/settings?tab=spreadsheet" className="w-full cursor-pointer pl-6" />}>Koneksi Spreadsheet</DropdownMenuItem>
                       </DropdownMenuGroup>
                     )}
                   </DropdownMenuContent>
