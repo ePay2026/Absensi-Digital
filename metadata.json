@@ -1,11 +1,9 @@
 {
-  "name": "Si Abon Elite App",
+  "name": "Absensi Digital",
   "description": "Sistem Absensi Online Elegan Informatif Terkini",
   "requestFramePermissions": [
     "camera",
     "geolocation"
   ],
-  "majorCapabilities": [
-    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
-  ]
+  "majorCapabilities": []
 }

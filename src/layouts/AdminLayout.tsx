@@ -18,7 +18,7 @@ export default function AdminLayout() {
   const location = useLocation();
   const navigate = useNavigate();
   const user = JSON.parse(localStorage.getItem('user') || '{}');
-  const [appName, setAppName] = useState("Si Abon Megilan");
+  const [appName, setAppName] = useState("Absensi Digital");
   const [appLogo, setAppLogo] = useState("");
   const [pendingCount, setPendingCount] = useState(0);
 

@@ -36,7 +36,7 @@ export default function Login() {
   const [units, setUnits] = useState<{id: string, name: string}[]>([]);
   const [locations, setLocations] = useState<{id: string, desa: string}[]>([]);
 
-  const [appName, setAppName] = useState("Absensi Digital");
+  const [appName, setAppName] = useState("Absensi Digital App");
   const [appLogo, setAppLogo] = useState("");
 
   useEffect(() => {

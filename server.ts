@@ -1,1315 +1,1773 @@
 import express from 'express';
-import path from 'path';
 import cors from 'cors';
-import crypto from 'crypto';
-import dotenv from 'dotenv';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import { GoogleSpreadsheet } from 'google-spreadsheet';
 import { JWT } from 'google-auth-library';
 import { Resend } from 'resend';
 
-dotenv.config();
+// Initialize Resend
+const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
 
-export const app = express();
-const PORT = 3000;
+async function startServer() {
+  const app = express();
+  const PORT = parseInt(process.env.PORT || '3000');
 
-app.use(cors());
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+  app.use(cors());
+  app.use(express.json({ limit: '50mb' }));
+  app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-// Google Sheets Client Setup
-let docInstance: GoogleSpreadsheet | null = null;
+  // Mock Database (In-Memory for Prototype)
+  const db = {
+    users: [
+      { id: 1, nip: '123456', name: 'Admin User', email: 'admin@puskesmas.com', role: 'admin', password: 'password', office: 'Kantor Induk', group: 'Superadmin' },
+      { id: 2, nip: '654321', name: 'Regular User', email: 'user@puskesmas.com', role: 'user', password: 'password', office: 'Pustu A' },
+    ],
+    employees: [
+      { id: '1', name: 'Admin User', nip: '123456', office: 'Kantor Induk', email: 'admin@puskesmas.com', gender: 'Laki-laki', cluster: 'Klaster 1', unit: 'Manajemen' },
+      { id: '2', name: 'Regular User', nip: '654321', office: 'Pustu A', email: 'user@puskesmas.com', gender: 'Perempuan', cluster: 'Klaster 2', unit: 'Pustu' }
+    ],
+    attendance: [],
+    locations: [
+      { id: 1, name: 'Kantor Induk', lat: -7.250445, lng: 112.768845, radius: 300 },
+    ],
+    settings: {
+      appName: 'Absensi Digital App',
+      companyName: 'Puskesmas Sehat',
+      headName: 'Dr. Budi Santoso',
+      address: 'Jl. Kesehatan No. 1, Kota Sehat',
+      mainLocation: '-7.250445, 112.768845',
+      tolerance: 25,
+    }
+  };
 
-function getSpreadsheetAuth() {
-  const email = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
-  let key = process.env.GOOGLE_PRIVATE_KEY;
-  if (key) {
-    key = key.replace(/\\n/g, '\n').replace(/^"|"$/g, '');
+  // Google Spreadsheet Setup
+  let doc: GoogleSpreadsheet | null = null;
+  let isDocLoaded = false;
+  let docLoadPromise: Promise<void> | null = null;
+  
+  // Cache for spreadsheet data
+  const cache: { [key: string]: { data: any; timestamp: number } } = {};
+    const inFlightRequests: { [key: string]: Promise<any> } = {};
+  const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes cache
+  const syncedSheets = new Set<string>();
+  
+  async function getCachedData(key: string, fetchFn: () => Promise<any>) {
+    if (cache[key] && Date.now() - cache[key].timestamp < CACHE_DURATION) {
+      return cache[key].data;
+    }
+    if (inFlightRequests[key]) {
+      return inFlightRequests[key];
+    }
+    const promise = fetchFn().then(data => {
+      cache[key] = { data, timestamp: Date.now() };
+      return data;
+    }).finally(() => {
+      delete inFlightRequests[key];
+    });
+    inFlightRequests[key] = promise;
+    return promise;
   }
-  const spreadsheetId = process.env.SPREADSHEET_ID;
-
-  if (!email || !key || !spreadsheetId) {
-    return null;
+  if (process.env.SPREADSHEET_ID && process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL && process.env.GOOGLE_PRIVATE_KEY) {
+    try {
+      let privateKey = process.env.GOOGLE_PRIVATE_KEY;
+      privateKey = privateKey.replace(/\\\\n/g, '\n').replace(/\\n/g, '\n');
+      if (!privateKey.includes('\n')) {
+        privateKey = privateKey.replace(/-----BEGIN PRIVATE KEY-----/, '-----BEGIN PRIVATE KEY-----\n')
+          .replace(/-----END PRIVATE KEY-----/, '\n-----END PRIVATE KEY-----\n')
+          .replace(/(.{64})/g, '$1\n');
+      }
+      console.log('Attempting to connect to Google Sheets...');
+      const serviceAccountAuth = new JWT({
+        email: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
+        key: privateKey,
+        scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+      });
+      doc = new GoogleSpreadsheet(process.env.SPREADSHEET_ID, serviceAccountAuth);
+      await doc.loadInfo();
+      isDocLoaded = true;
+      console.log('Google Spreadsheet connected successfully:', doc.title);
+    } catch (error) {
+      console.error('Failed to connect to Google Spreadsheet:', error);
+      doc = null;
+    }
+  } else {
+    console.warn('Google Sheets environment variables are missing.');
   }
 
-  const auth = new JWT({
-    email,
-    key,
-    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-  });
-
-  return new GoogleSpreadsheet(spreadsheetId, auth);
-}
-
-async function getDoc(): Promise<GoogleSpreadsheet | null> {
-  if (docInstance) return docInstance;
-  try {
-    const doc = getSpreadsheetAuth();
+  // Helper to get or create sheet
+  async function getSheet(title: string) {
     if (!doc) {
-      console.warn('Google Spreadsheet credentials not fully configured in environment variables.');
+      console.error(`Cannot get sheet '${title}': Spreadsheet not connected.`);
       return null;
     }
-    await doc.loadInfo();
-    console.log(`Google Spreadsheet connected successfully: ${doc.title}`);
-    docInstance = doc;
-    return docInstance;
-  } catch (err) {
-    console.error('Failed to connect to Google Sheets:', err);
-    return null;
-  }
-}
-
-async function getSheet(title: string) {
-  const doc = await getDoc();
-  if (!doc) return null;
-  let sheet = doc.sheetsByTitle[title];
-  if (!sheet) {
-    // Try to reload info once in case sheet was created recently
-    await doc.loadInfo();
-    sheet = doc.sheetsByTitle[title];
-  }
-  return sheet || null;
-}
-
-// Resend Email Client
-let resendClient: Resend | null = null;
-function getResend() {
-  if (!resendClient && process.env.RESEND_API_KEY) {
-    resendClient = new Resend(process.env.RESEND_API_KEY);
-  }
-  return resendClient;
-}
-
-function safeJsonParse(str: any) {
-  if (!str) return null;
-  if (typeof str === 'object') return str;
-  try {
-    return JSON.parse(str);
-  } catch {
-    return str;
-  }
-}
-
-// ==========================================
-// API ROUTES
-// ==========================================
-
-// Health Check
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: Date.now() });
-});
-
-// Time Sync (Server Time)
-app.get(['/api/time', '/api/server-time'], (req, res) => {
-  const now = new Date();
-  res.json({
-    time: now.toISOString(),
-    timestamp: now.getTime(),
-    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-  });
-});
-
-// Settings Endpoints
-app.get('/api/settings', async (req, res) => {
-  try {
-    const sheet = await getSheet('Settings');
-    const settingsMap: Record<string, any> = {
-      generalSettings: {
-        appName: 'Si Abon Elite App',
-        appLogo: '',
-        companyName: 'Puskesmas SEHAT',
-        headName: 'dr. Xxxxx',
-        email: 'pkm.paciran@gmail.com',
-        address: 'Jl. Raya Paciran No.78',
-        mainLocation: '-7.250445, 112.768845',
-      },
-      absensiSettings: {
-        tolerance: '15',
-        enableCountdown: true,
-        enableEarlyCheckout: true,
-      },
-      leaveSettings: {
-        autoApprove: '0',
-      },
-    };
-
-    if (sheet) {
-      const rows = await sheet.getRows();
-      for (const row of rows) {
-        const key = row.get('key');
-        const rawVal = row.get('value');
-        if (key && rawVal) {
-          settingsMap[key] = safeJsonParse(rawVal);
+    try {
+      // Ensure doc is loaded
+      if (!isDocLoaded) {
+        if (!docLoadPromise) {
+          docLoadPromise = (async () => {
+            try {
+              if (doc) await doc.loadInfo();
+              isDocLoaded = true;
+            } finally {
+              docLoadPromise = null;
+            }
+          })();
         }
+        await docLoadPromise;
       }
-    }
-
-    res.json(settingsMap);
-  } catch (err: any) {
-    console.error('Error fetching settings:', err);
-    res.status(500).json({ error: 'Failed to fetch settings', message: err.message });
-  }
-});
-
-app.post('/api/settings', async (req, res) => {
-  try {
-    const { key, value } = req.body;
-    if (!key) {
-      return res.status(400).json({ success: false, message: 'Key is required' });
-    }
-
-    const sheet = await getSheet('Settings');
-    if (!sheet) {
-      return res.status(500).json({ success: false, message: 'Settings sheet not available' });
-    }
-
-    const rows = await sheet.getRows();
-    const existing = rows.find((r) => r.get('key') === key);
-    const valueStr = typeof value === 'object' ? JSON.stringify(value) : String(value);
-
-    if (existing) {
-      existing.assign({ value: valueStr });
-      await existing.save();
-    } else {
-      await sheet.addRow({ key, value: valueStr });
-    }
-
-    res.json({ success: true });
-  } catch (err: any) {
-    console.error('Error saving setting:', err);
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-// Units Endpoints
-app.get('/api/units', async (req, res) => {
-  try {
-    const sheet = await getSheet('Units');
-    if (!sheet) return res.json([]);
-    const rows = await sheet.getRows();
-    const units = rows.map((r) => ({
-      id: r.get('id') || '',
-      name: r.get('name') || '',
-    }));
-    res.json(units);
-  } catch (err: any) {
-    console.error('Error fetching units:', err);
-    res.status(500).json({ error: 'Failed to fetch units', message: err.message });
-  }
-});
-
-app.post('/api/units', async (req, res) => {
-  try {
-    const { id, name } = req.body;
-    const sheet = await getSheet('Units');
-    if (!sheet) return res.status(500).json({ success: false, message: 'Units sheet not found' });
-    const unitId = id || Date.now().toString();
-    await sheet.addRow({ id: unitId, name: name || '' });
-    res.json({ success: true, id: unitId, name });
-  } catch (err: any) {
-    console.error('Error adding unit:', err);
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-app.delete('/api/units/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const sheet = await getSheet('Units');
-    if (!sheet) return res.status(500).json({ success: false, message: 'Units sheet not found' });
-    const rows = await sheet.getRows();
-    const target = rows.find((r) => r.get('id') === id);
-    if (target) {
-      await target.delete();
-    }
-    res.json({ success: true });
-  } catch (err: any) {
-    console.error('Error deleting unit:', err);
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-// Locations Endpoints
-app.get('/api/locations', async (req, res) => {
-  try {
-    const sheet = await getSheet('Locations');
-    if (!sheet) return res.json([]);
-    const rows = await sheet.getRows();
-    const locations = rows.map((r) => ({
-      id: r.get('id') || '',
-      name: r.get('name') || '',
-      desa: r.get('desa') || r.get('name') || '',
-      kecamatan: r.get('kecamatan') || '',
-      kabupaten: r.get('kabupaten') || '',
-      coordinates: r.get('coordinates') || '',
-      radius: parseInt(r.get('radius') || '100', 10),
-    }));
-    res.json(locations);
-  } catch (err: any) {
-    console.error('Error fetching locations:', err);
-    res.status(500).json({ error: 'Failed to fetch locations', message: err.message });
-  }
-});
-
-app.post('/api/locations', async (req, res) => {
-  try {
-    const { id, name, desa, kecamatan, kabupaten, coordinates, radius } = req.body;
-    const sheet = await getSheet('Locations');
-    if (!sheet) return res.status(500).json({ success: false, message: 'Locations sheet not found' });
-
-    const locId = id || Date.now().toString();
-    const rows = await sheet.getRows();
-    const existing = rows.find((r) => r.get('id') === locId);
-
-    const record = {
-      id: locId,
-      name: name || desa || '',
-      desa: desa || name || '',
-      kecamatan: kecamatan || '',
-      kabupaten: kabupaten || '',
-      coordinates: coordinates || '',
-      radius: String(radius || 100),
-    };
-
-    if (existing) {
-      existing.assign(record);
-      await existing.save();
-    } else {
-      await sheet.addRow(record);
-    }
-
-    res.json({ success: true, location: record });
-  } catch (err: any) {
-    console.error('Error saving location:', err);
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-app.delete('/api/locations/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const sheet = await getSheet('Locations');
-    if (!sheet) return res.status(500).json({ success: false, message: 'Locations sheet not found' });
-    const rows = await sheet.getRows();
-    const target = rows.find((r) => r.get('id') === id);
-    if (target) {
-      await target.delete();
-    }
-    res.json({ success: true });
-  } catch (err: any) {
-    console.error('Error deleting location:', err);
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-// Shifts Endpoints
-app.get('/api/shifts', async (req, res) => {
-  try {
-    const sheet = await getSheet('Shifts');
-    if (!sheet) return res.json([]);
-    const rows = await sheet.getRows();
-    const shifts = rows.map((r) => ({
-      id: r.get('id') || '',
-      name: r.get('name') || '',
-      startTime: r.get('startTime') || '',
-      endTime: r.get('endTime') || '',
-      fridayEndTime: r.get('fridayEndTime') || '',
-      saturdayEndTime: r.get('saturdayEndTime') || '',
-      checkInBeforeMinutes: r.get('checkInBeforeMinutes') || '60',
-      checkInAfterMinutes: r.get('checkInAfterMinutes') || '15',
-      checkOutBeforeMinutes: r.get('checkOutBeforeMinutes') || '10',
-      checkOutAfterMinutes: r.get('checkOutAfterMinutes') || '120',
-      crossesMidnight: r.get('crossesMidnight') === 'TRUE' || r.get('crossesMidnight') === 'true',
-      isActive: r.get('isActive') !== 'FALSE' && r.get('isActive') !== 'false',
-      unit: r.get('unit') || '',
-      isOffSunday: r.get('isOffSunday') === 'TRUE' || r.get('isOffSunday') === 'true',
-      isOffHoliday: r.get('isOffHoliday') === 'TRUE' || r.get('isOffHoliday') === 'true',
-    }));
-    res.json(shifts);
-  } catch (err: any) {
-    console.error('Error fetching shifts:', err);
-    res.status(500).json({ error: 'Failed to fetch shifts', message: err.message });
-  }
-});
-
-app.post('/api/shifts', async (req, res) => {
-  try {
-    const shift = req.body;
-    const sheet = await getSheet('Shifts');
-    if (!sheet) return res.status(500).json({ success: false, message: 'Shifts sheet not found' });
-
-    const shiftId = shift.id || Date.now().toString();
-    await sheet.addRow({
-      id: shiftId,
-      name: shift.name || '',
-      startTime: shift.startTime || '',
-      endTime: shift.endTime || '',
-      fridayEndTime: shift.fridayEndTime || '',
-      saturdayEndTime: shift.saturdayEndTime || '',
-      checkInBeforeMinutes: String(shift.checkInBeforeMinutes ?? '60'),
-      checkInAfterMinutes: String(shift.checkInAfterMinutes ?? '15'),
-      checkOutBeforeMinutes: String(shift.checkOutBeforeMinutes ?? '10'),
-      checkOutAfterMinutes: String(shift.checkOutAfterMinutes ?? '120'),
-      crossesMidnight: shift.crossesMidnight ? 'TRUE' : 'FALSE',
-      isActive: shift.isActive !== false ? 'TRUE' : 'FALSE',
-      unit: shift.unit || '',
-      isOffSunday: shift.isOffSunday ? 'TRUE' : 'FALSE',
-      isOffHoliday: shift.isOffHoliday ? 'TRUE' : 'FALSE',
-    });
-
-    res.json({ success: true, id: shiftId });
-  } catch (err: any) {
-    console.error('Error adding shift:', err);
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-app.put('/api/shifts/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const shift = req.body;
-    const sheet = await getSheet('Shifts');
-    if (!sheet) return res.status(500).json({ success: false, message: 'Shifts sheet not found' });
-
-    const rows = await sheet.getRows();
-    const target = rows.find((r) => r.get('id') === id);
-    if (target) {
-      target.assign({
-        name: shift.name ?? target.get('name'),
-        startTime: shift.startTime ?? target.get('startTime'),
-        endTime: shift.endTime ?? target.get('endTime'),
-        fridayEndTime: shift.fridayEndTime ?? target.get('fridayEndTime'),
-        saturdayEndTime: shift.saturdayEndTime ?? target.get('saturdayEndTime'),
-        checkInBeforeMinutes: String(shift.checkInBeforeMinutes ?? target.get('checkInBeforeMinutes')),
-        checkInAfterMinutes: String(shift.checkInAfterMinutes ?? target.get('checkInAfterMinutes')),
-        checkOutBeforeMinutes: String(shift.checkOutBeforeMinutes ?? target.get('checkOutBeforeMinutes')),
-        checkOutAfterMinutes: String(shift.checkOutAfterMinutes ?? target.get('checkOutAfterMinutes')),
-        crossesMidnight: shift.crossesMidnight !== undefined ? (shift.crossesMidnight ? 'TRUE' : 'FALSE') : target.get('crossesMidnight'),
-        isActive: shift.isActive !== undefined ? (shift.isActive ? 'TRUE' : 'FALSE') : target.get('isActive'),
-        unit: shift.unit ?? target.get('unit'),
-        isOffSunday: shift.isOffSunday !== undefined ? (shift.isOffSunday ? 'TRUE' : 'FALSE') : target.get('isOffSunday'),
-        isOffHoliday: shift.isOffHoliday !== undefined ? (shift.isOffHoliday ? 'TRUE' : 'FALSE') : target.get('isOffHoliday'),
-      });
-      await target.save();
-    }
-    res.json({ success: true });
-  } catch (err: any) {
-    console.error('Error updating shift:', err);
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-app.delete('/api/shifts/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const sheet = await getSheet('Shifts');
-    if (!sheet) return res.status(500).json({ success: false, message: 'Shifts sheet not found' });
-    const rows = await sheet.getRows();
-    const target = rows.find((r) => r.get('id') === id);
-    if (target) {
-      await target.delete();
-    }
-    res.json({ success: true });
-  } catch (err: any) {
-    console.error('Error deleting shift:', err);
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-// Employees Endpoints
-app.get('/api/employees', async (req, res) => {
-  try {
-    const sheet = await getSheet('Employees');
-    if (!sheet) return res.json([]);
-    const rows = await sheet.getRows();
-    const employees = rows.map((r) => ({
-      id: r.get('id') || '',
-      name: r.get('name') || '',
-      nip: r.get('nip') || '',
-      office: r.get('office') || '',
-      office2: r.get('office2') || '',
-      email: r.get('email') || '',
-      gender: r.get('gender') || '',
-      cluster: r.get('cluster') || '',
-      unit: r.get('unit') || '',
-      photoUrl: r.get('photoUrl') || '',
-      photoUploadCount: parseInt(r.get('photoUploadCount') || '0', 10),
-    }));
-    res.json(employees);
-  } catch (err: any) {
-    console.error('Error fetching employees:', err);
-    res.status(500).json({ error: 'Failed to fetch employees', message: err.message });
-  }
-});
-
-app.post('/api/employees', async (req, res) => {
-  try {
-    const emp = req.body;
-    const sheet = await getSheet('Employees');
-    if (!sheet) return res.status(500).json({ success: false, message: 'Employees sheet not found' });
-
-    const empId = emp.id || Date.now().toString();
-    await sheet.addRow({
-      id: empId,
-      name: emp.name || '',
-      nip: String(emp.nip || ''),
-      office: emp.office || '',
-      office2: emp.office2 || '',
-      email: emp.email || '',
-      gender: emp.gender || '',
-      cluster: emp.cluster || '',
-      unit: emp.unit || '',
-      password: emp.password || '123456',
-      photoUrl: emp.photoUrl || '',
-      photoUploadCount: String(emp.photoUploadCount || '0'),
-    });
-
-    res.json({ success: true, id: empId });
-  } catch (err: any) {
-    console.error('Error adding employee:', err);
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-app.post('/api/employees/bulk', async (req, res) => {
-  try {
-    const employees = req.body;
-    if (!Array.isArray(employees) || employees.length === 0) {
-      return res.status(400).json({ success: false, message: 'Invalid employees array' });
-    }
-
-    const sheet = await getSheet('Employees');
-    if (!sheet) return res.status(500).json({ success: false, message: 'Employees sheet not found' });
-
-    const rowsToAdd = employees.map((emp, index) => ({
-      id: emp.id || (Date.now() + index).toString(),
-      name: emp.name || '',
-      nip: String(emp.nip || ''),
-      office: emp.office || '',
-      office2: emp.office2 || '',
-      email: emp.email || '',
-      gender: emp.gender || '',
-      cluster: emp.cluster || '',
-      unit: emp.unit || '',
-      password: emp.password || '123456',
-      photoUrl: emp.photoUrl || '',
-      photoUploadCount: '0',
-    }));
-
-    await sheet.addRows(rowsToAdd);
-    res.json({ success: true, count: rowsToAdd.length });
-  } catch (err: any) {
-    console.error('Error bulk uploading employees:', err);
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-app.delete('/api/employees/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const sheet = await getSheet('Employees');
-    if (!sheet) return res.status(500).json({ success: false, message: 'Employees sheet not found' });
-    const rows = await sheet.getRows();
-    const target = rows.find((r) => r.get('id') === id);
-    if (target) {
-      await target.delete();
-    }
-    res.json({ success: true });
-  } catch (err: any) {
-    console.error('Error deleting employee:', err);
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-app.post('/api/employees/photo', async (req, res) => {
-  try {
-    const { nip, photoUrl } = req.body;
-    if (!nip) {
-      return res.status(400).json({ success: false, message: 'NIP is required' });
-    }
-
-    const sheet = await getSheet('Employees');
-    if (!sheet) return res.status(500).json({ success: false, message: 'Employees sheet not found' });
-
-    const rows = await sheet.getRows();
-    const target = rows.find((r) => r.get('nip') === String(nip));
-    if (!target) {
-      return res.status(404).json({ success: false, message: 'Karyawan tidak ditemukan' });
-    }
-
-    const currentCount = parseInt(target.get('photoUploadCount') || '0', 10);
-    if (currentCount >= 5) {
-      return res.status(400).json({ success: false, message: 'Batas unggah foto telah mencapai maksimal (5 kali).' });
-    }
-
-    const newCount = currentCount + 1;
-    target.assign({
-      photoUrl: photoUrl || '',
-      photoUploadCount: String(newCount),
-    });
-    await target.save();
-
-    res.json({
-      success: true,
-      message: 'Foto profil berhasil diperbarui',
-      photoUrl,
-      photoUploadCount: newCount,
-    });
-  } catch (err: any) {
-    console.error('Error updating employee photo:', err);
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-// Admins Endpoints
-app.get('/api/admins', async (req, res) => {
-  try {
-    const sheet = await getSheet('Admins');
-    if (!sheet) {
-      return res.json([
-        {
-          id: '1',
-          name: 'Super Admin',
-          nip: '000000',
-          email: 'super@admin.com',
-          phone: '081234567890',
-          group: 'Superadmin',
-          isActive: true,
-          access: ['Absensi', 'Master Data', 'Sistem'],
-        },
-      ]);
-    }
-
-    const rows = await sheet.getRows();
-    if (rows.length === 0) {
-      return res.json([
-        {
-          id: '1',
-          name: 'Super Admin',
-          nip: '000000',
-          email: 'super@admin.com',
-          phone: '081234567890',
-          group: 'Superadmin',
-          isActive: true,
-          access: ['Absensi', 'Master Data', 'Sistem'],
-        },
-      ]);
-    }
-
-    const admins = rows.map((r) => ({
-      id: r.get('id') || '',
-      name: r.get('name') || '',
-      nip: r.get('nip') || '',
-      email: r.get('email') || '',
-      phone: r.get('phone') || '',
-      group: r.get('group') || 'Admin',
-      isActive: r.get('isActive') !== 'FALSE' && r.get('isActive') !== 'false',
-      access: safeJsonParse(r.get('access')) || ['Absensi', 'Master Data', 'Sistem'],
-    }));
-
-    res.json(admins);
-  } catch (err: any) {
-    console.error('Error fetching admins:', err);
-    res.status(500).json({ error: 'Failed to fetch admins', message: err.message });
-  }
-});
-
-app.post('/api/admins', async (req, res) => {
-  try {
-    const admin = req.body;
-    const sheet = await getSheet('Admins');
-    if (!sheet) return res.status(500).json({ success: false, message: 'Admins sheet not found' });
-
-    const adminId = admin.id || Date.now().toString();
-    await sheet.addRow({
-      id: adminId,
-      name: admin.name || '',
-      nip: String(admin.nip || ''),
-      email: admin.email || '',
-      phone: admin.phone || '',
-      group: admin.group || 'Admin',
-      isActive: admin.isActive !== false ? 'TRUE' : 'FALSE',
-      access: JSON.stringify(admin.access || ['Absensi']),
-      password: admin.password || 'admin123',
-    });
-
-    res.json({ success: true, id: adminId });
-  } catch (err: any) {
-    console.error('Error adding admin:', err);
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-app.put('/api/admins/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const admin = req.body;
-    const sheet = await getSheet('Admins');
-    if (!sheet) return res.status(500).json({ success: false, message: 'Admins sheet not found' });
-
-    const rows = await sheet.getRows();
-    const target = rows.find((r) => r.get('id') === id);
-    if (target) {
-      target.assign({
-        name: admin.name ?? target.get('name'),
-        nip: admin.nip !== undefined ? String(admin.nip) : target.get('nip'),
-        email: admin.email ?? target.get('email'),
-        phone: admin.phone ?? target.get('phone'),
-        group: admin.group ?? target.get('group'),
-        isActive: admin.isActive !== undefined ? (admin.isActive ? 'TRUE' : 'FALSE') : target.get('isActive'),
-        access: admin.access ? JSON.stringify(admin.access) : target.get('access'),
-        ...(admin.password ? { password: admin.password } : {}),
-      });
-      await target.save();
-    }
-    res.json({ success: true });
-  } catch (err: any) {
-    console.error('Error updating admin:', err);
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-app.delete('/api/admins/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const sheet = await getSheet('Admins');
-    if (!sheet) return res.status(500).json({ success: false, message: 'Admins sheet not found' });
-    const rows = await sheet.getRows();
-    const target = rows.find((r) => r.get('id') === id);
-    if (target) {
-      await target.delete();
-    }
-    res.json({ success: true });
-  } catch (err: any) {
-    console.error('Error deleting admin:', err);
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-// Attendance Endpoints
-app.get('/api/attendance', async (req, res) => {
-  try {
-    const sheet = await getSheet('Attendance');
-    if (!sheet) return res.json([]);
-
-    const { startDate, endDate } = req.query as { startDate?: string; endDate?: string };
-    const rows = await sheet.getRows();
-
-    let records = rows.map((r) => ({
-      id: r.get('id') || '',
-      nip: r.get('nip') || '',
-      name: r.get('name') || '',
-      date: r.get('date') || '',
-      time: r.get('time') || '',
-      type: r.get('type') || '',
-      location: safeJsonParse(r.get('location')),
-      status: r.get('status') || '',
-      photoUrl: r.get('photoUrl') || '',
-      shift: r.get('shift') || '',
-    }));
-
-    if (startDate && endDate) {
-      records = records.filter((r) => {
-        if (!r.date) return false;
-        // Direct date within range
-        if (r.date >= startDate && r.date <= endDate) return true;
-        // Check leave endDate if applicable
-        if (r.location && typeof r.location === 'object' && r.location.endDate) {
-          const locEnd = r.location.endDate;
-          return locEnd >= startDate && r.date <= endDate;
-        }
-        return false;
-      });
-    }
-
-    res.json(records);
-  } catch (err: any) {
-    console.error('Error fetching attendance:', err);
-    res.status(500).json({ error: 'Failed to fetch attendance', message: err.message });
-  }
-});
-
-app.post('/api/attendance', async (req, res) => {
-  try {
-    const { nip, name, date, time, type, location, status, photoUrl, shift } = req.body;
-    const sheet = await getSheet('Attendance');
-    if (!sheet) return res.status(500).json({ success: false, message: 'Attendance sheet not found' });
-
-    const attId = Date.now().toString();
-    await sheet.addRow({
-      id: attId,
-      nip: String(nip || ''),
-      name: name || '',
-      date: date || new Date().toISOString().split('T')[0],
-      time: time || '',
-      type: type || 'in',
-      location: typeof location === 'object' ? JSON.stringify(location) : String(location || ''),
-      status: status || 'Hadir',
-      photoUrl: photoUrl || '',
-      shift: shift || '',
-    });
-
-    res.json({ success: true, id: attId });
-  } catch (err: any) {
-    console.error('Error recording attendance:', err);
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-app.put('/api/attendance/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { status } = req.body;
-    const sheet = await getSheet('Attendance');
-    if (!sheet) return res.status(500).json({ success: false, message: 'Attendance sheet not found' });
-
-    const rows = await sheet.getRows();
-    const target = rows.find((r) => r.get('id') === id);
-    if (target) {
-      target.assign({ status: status || target.get('status') });
-      await target.save();
-    }
-    res.json({ success: true });
-  } catch (err: any) {
-    console.error('Error updating attendance status:', err);
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-app.delete('/api/attendance/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const sheet = await getSheet('Attendance');
-    if (!sheet) return res.status(500).json({ success: false, message: 'Attendance sheet not found' });
-
-    const rows = await sheet.getRows();
-    const target = rows.find((r) => r.get('id') === id);
-    if (target) {
-      await target.delete();
-    }
-    res.json({ success: true });
-  } catch (err: any) {
-    console.error('Error deleting attendance record:', err);
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-app.post('/api/attendance/auto-checkout-check', async (req, res) => {
-  res.json({ success: true, message: 'Auto checkout verification completed' });
-});
-
-// Announcements Endpoints
-app.get('/api/announcements', async (req, res) => {
-  try {
-    const sheet = await getSheet('Announcements');
-    if (!sheet) return res.json([]);
-    const rows = await sheet.getRows();
-    const announcements = rows.map((r) => ({
-      id: r.get('id') || '',
-      title: r.get('title') || '',
-      content: r.get('content') || '',
-      date: r.get('date') || '',
-      expiryDate: r.get('expiryDate') || '',
-      isActive: r.get('isActive') !== 'FALSE' && r.get('isActive') !== 'false',
-    }));
-    res.json(announcements);
-  } catch (err: any) {
-    console.error('Error fetching announcements:', err);
-    res.status(500).json({ error: 'Failed to fetch announcements', message: err.message });
-  }
-});
-
-app.post('/api/announcements', async (req, res) => {
-  try {
-    const { title, content, date, expiryDate, isActive } = req.body;
-    const sheet = await getSheet('Announcements');
-    if (!sheet) return res.status(500).json({ success: false, message: 'Announcements sheet not found' });
-
-    const id = Date.now().toString();
-    await sheet.addRow({
-      id,
-      title: title || '',
-      content: content || '',
-      date: date || new Date().toISOString().split('T')[0],
-      expiryDate: expiryDate || '',
-      isActive: isActive !== false ? 'TRUE' : 'FALSE',
-    });
-
-    res.json({ success: true, id });
-  } catch (err: any) {
-    console.error('Error adding announcement:', err);
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-app.put('/api/announcements/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { title, content, date, expiryDate, isActive } = req.body;
-    const sheet = await getSheet('Announcements');
-    if (!sheet) return res.status(500).json({ success: false, message: 'Announcements sheet not found' });
-
-    const rows = await sheet.getRows();
-    const target = rows.find((r) => r.get('id') === id);
-    if (target) {
-      target.assign({
-        title: title ?? target.get('title'),
-        content: content ?? target.get('content'),
-        date: date ?? target.get('date'),
-        expiryDate: expiryDate ?? target.get('expiryDate'),
-        isActive: isActive !== undefined ? (isActive ? 'TRUE' : 'FALSE') : target.get('isActive'),
-      });
-      await target.save();
-    }
-    res.json({ success: true });
-  } catch (err: any) {
-    console.error('Error updating announcement:', err);
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-app.delete('/api/announcements/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const sheet = await getSheet('Announcements');
-    if (!sheet) return res.status(500).json({ success: false, message: 'Announcements sheet not found' });
-    const rows = await sheet.getRows();
-    const target = rows.find((r) => r.get('id') === id);
-    if (target) {
-      await target.delete();
-    }
-    res.json({ success: true });
-  } catch (err: any) {
-    console.error('Error deleting announcement:', err);
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-// Holidays Endpoints
-app.get('/api/holidays', async (req, res) => {
-  try {
-    const sheet = await getSheet('Holidays');
-    if (!sheet) return res.json([]);
-    const rows = await sheet.getRows();
-    const holidays = rows.map((r) => ({
-      id: r.get('id') || '',
-      date: r.get('date') || '',
-      name: r.get('name') || '',
-    }));
-    res.json(holidays);
-  } catch (err: any) {
-    console.error('Error fetching holidays:', err);
-    res.status(500).json({ error: 'Failed to fetch holidays', message: err.message });
-  }
-});
-
-app.post('/api/holidays', async (req, res) => {
-  try {
-    const { date, name } = req.body;
-    const sheet = await getSheet('Holidays');
-    if (!sheet) return res.status(500).json({ success: false, message: 'Holidays sheet not found' });
-
-    const id = Date.now().toString();
-    await sheet.addRow({
-      id,
-      date: date || '',
-      name: name || '',
-    });
-
-    res.json({ success: true, id });
-  } catch (err: any) {
-    console.error('Error adding holiday:', err);
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-app.delete('/api/holidays/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const sheet = await getSheet('Holidays');
-    if (!sheet) return res.status(500).json({ success: false, message: 'Holidays sheet not found' });
-    const rows = await sheet.getRows();
-    const target = rows.find((r) => r.get('id') === id);
-    if (target) {
-      await target.delete();
-    }
-    res.json({ success: true });
-  } catch (err: any) {
-    console.error('Error deleting holiday:', err);
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-// Device Bindings Reset Endpoint
-app.delete('/api/device-bindings/:nip', async (req, res) => {
-  try {
-    const { nip } = req.params;
-    const sheet = await getSheet('DeviceBindings');
-    if (!sheet) return res.status(500).json({ success: false, message: 'DeviceBindings sheet not found' });
-
-    const rows = await sheet.getRows();
-    const target = rows.find((r) => r.get('nip') === String(nip));
-    if (target) {
-      await target.delete();
-    }
-    res.json({ success: true, message: 'Perangkat berhasil direset' });
-  } catch (err: any) {
-    console.error('Error resetting device binding:', err);
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-// Authentication: Login
-app.post('/api/login', async (req, res) => {
-  try {
-    const { nip, password, deviceId } = req.body;
-    if (!nip || !password) {
-      return res.status(400).json({ success: false, message: 'NIP dan password wajib diisi' });
-    }
-
-    const nipStr = String(nip).trim();
-    const passStr = String(password).trim();
-
-    // 1. Check Admin logins
-    if (
-      (nipStr === 'admin' && passStr === 'admin') ||
-      (nipStr === '000000' && (passStr === 'admin' || passStr === '123456'))
-    ) {
-      return res.json({
-        success: true,
-        user: {
-          id: '1',
-          name: 'Super Admin',
-          nip: nipStr,
-          email: 'super@admin.com',
-          role: 'admin',
-          group: 'Superadmin',
-          access: ['Absensi', 'Master Data', 'Sistem'],
-        },
-      });
-    }
-
-    // Check Admins sheet
-    const adminSheet = await getSheet('Admins');
-    if (adminSheet) {
-      const adminRows = await adminSheet.getRows();
-      const adminUser = adminRows.find(
-        (r) =>
-          (r.get('nip') === nipStr || r.get('email') === nipStr) &&
-          String(r.get('password') || '').trim() === passStr &&
-          r.get('isActive') !== 'FALSE' &&
-          r.get('isActive') !== 'false'
-      );
-
-      if (adminUser) {
-        return res.json({
-          success: true,
-          user: {
-            id: adminUser.get('id') || '1',
-            name: adminUser.get('name') || 'Admin',
-            nip: adminUser.get('nip') || nipStr,
-            email: adminUser.get('email') || '',
-            role: 'admin',
-            group: adminUser.get('group') || 'Admin',
-            access: safeJsonParse(adminUser.get('access')) || ['Absensi', 'Master Data'],
-          },
-        });
+      const sheet = doc.sheetsByTitle[title];
+      if (!sheet) {
+        console.error(`Sheet '${title}' not found in spreadsheet.`);
+        return null;
       }
+      return sheet;
+    } catch (error) {
+      console.error(`Error getting sheet ${title}:`, error);
+      return null;
     }
+  }
 
-    // 2. Check Employees sheet
-    const empSheet = await getSheet('Employees');
-    if (!empSheet) {
-      return res.status(500).json({ success: false, message: 'Database karyawan tidak tersedia' });
-    }
-
-    const empRows = await empSheet.getRows();
-    const employee = empRows.find((r) => r.get('nip') === nipStr);
-
-    if (!employee) {
-      return res.status(401).json({ success: false, message: 'NIP tidak terdaftar' });
-    }
-
-    if (String(employee.get('password') || '').trim() !== passStr) {
-      return res.status(401).json({ success: false, message: 'Password salah' });
-    }
-
-    // 3. Verify Device Binding
-    if (deviceId) {
-      const bindingSheet = await getSheet('DeviceBindings');
-      if (bindingSheet) {
-        const bindingRows = await bindingSheet.getRows();
-        const existingBinding = bindingRows.find((r) => r.get('nip') === nipStr);
-
-        if (existingBinding) {
-          const boundId = existingBinding.get('deviceId');
-          if (boundId && boundId !== deviceId) {
-            return res.status(403).json({
-              success: false,
-              message: 'Akun ini terikat dengan perangkat lain. Hubungi admin untuk mereset perangkat.',
-            });
+  // Helper to get or create sheet
+  async function getOrCreateSheet(title: string, headerValues: string[]) {
+    let sheet = await getSheet(title);
+    if (!sheet && doc) {
+      sheet = await doc.addSheet({ title, headerValues });
+      syncedSheets.add(title);
+    } else if (sheet && !syncedSheets.has(title)) {
+      try {
+        await sheet.loadHeaderRow();
+        const currentHeaders = sheet.headerValues;
+        let headersChanged = false;
+        const newHeaders = [...currentHeaders];
+        for (const header of headerValues) {
+          if (!newHeaders.includes(header)) {
+            newHeaders.push(header);
+            headersChanged = true;
           }
-        } else {
-          // Bind this device
-          await bindingSheet.addRow({ nip: nipStr, deviceId });
         }
+        if (headersChanged) {
+          await sheet.setHeaderRow(newHeaders);
+        }
+        syncedSheets.add(title);
+      } catch (e) {
+        // If sheet is empty, loadHeaderRow might throw. Set headers directly.
+        await sheet.setHeaderRow(headerValues);
+        syncedSheets.add(title);
       }
     }
-
-    return res.json({
-      success: true,
-      user: {
-        id: employee.get('id') || '',
-        name: employee.get('name') || '',
-        nip: employee.get('nip') || '',
-        office: employee.get('office') || '',
-        office2: employee.get('office2') || '',
-        email: employee.get('email') || '',
-        gender: employee.get('gender') || '',
-        cluster: employee.get('cluster') || '',
-        unit: employee.get('unit') || '',
-        role: 'user',
-        photoUrl: employee.get('photoUrl') || '',
-        photoUploadCount: parseInt(employee.get('photoUploadCount') || '0', 10),
-      },
-    });
-  } catch (err: any) {
-    console.error('Error during login:', err);
-    res.status(500).json({ success: false, message: 'Terjadi kesalahan server: ' + err.message });
+    return sheet;
   }
-});
 
-// Authentication: Register
-app.post('/api/register', async (req, res) => {
-  try {
-    const { nip, name, email, password, gender, cluster, unit, desa, office2 } = req.body;
-    if (!nip || !name || !password) {
-      return res.status(400).json({ success: false, message: 'NIP, nama, dan password wajib diisi' });
+  // API Routes
+
+  // --- Employees API ---
+  app.get('/api/employees', async (req, res) => {
+    if (doc) {
+      try {
+        const employees = await getCachedData('employees', async () => {
+          const sheet = await getOrCreateSheet('Employees', ['id', 'name', 'nip', 'office', 'office2', 'email', 'gender', 'cluster', 'unit', 'password', 'photoUrl', 'photoUploadCount']);
+          if (sheet) {
+            const rows = await sheet.getRows();
+            return rows.map(row => ({
+              id: row.get('id'),
+              name: row.get('name'),
+              nip: row.get('nip'),
+              office: row.get('office'),
+              office2: row.get('office2'),
+              email: row.get('email'),
+              gender: row.get('gender'),
+              cluster: row.get('cluster'),
+              unit: row.get('unit'),
+              password: row.get('password'),
+              photoUrl: row.get('photoUrl'),
+              photoUploadCount: row.get('photoUploadCount') ? parseInt(row.get('photoUploadCount'), 10) : 0
+            }));
+          }
+          return [];
+        });
+        return res.json(employees);
+      } catch (error) {
+        console.error('Error fetching employees from spreadsheet:', error);
+      }
+    }
+    res.json(db.employees);
+  });
+
+  app.post('/api/employees', async (req, res) => {
+    const employee = req.body;
+    
+    if (doc) {
+      try {
+        const sheet = await getOrCreateSheet('Employees', ['id', 'name', 'nip', 'office', 'office2', 'email', 'gender', 'cluster', 'unit', 'password', 'photoUrl', 'photoUploadCount']);
+        if (sheet) {
+          await sheet.addRow({
+            ...employee,
+            office2: employee.office2 || ''
+          });
+          delete cache['employees'];
+        }
+      } catch (error) {
+        console.error('Error saving employee to spreadsheet:', error);
+      }
+    } else {
+      db.employees.push(employee);
+    }
+    res.json({ success: true, message: 'Karyawan berhasil ditambahkan' });
+  });
+
+  app.post('/api/employees/bulk', async (req, res) => {
+    const employeesData = req.body; // Array of employee objects
+    
+    if (!Array.isArray(employeesData)) {
+      return res.status(400).json({ success: false, message: 'Data harus berupa array' });
     }
 
-    const nipStr = String(nip).trim();
-    const empSheet = await getSheet('Employees');
-    if (!empSheet) {
-      return res.status(500).json({ success: false, message: 'Database karyawan tidak tersedia' });
+    if (doc) {
+      try {
+        const sheet = await getOrCreateSheet('Employees', ['id', 'name', 'nip', 'office', 'office2', 'email', 'gender', 'cluster', 'unit', 'password', 'photoUrl', 'photoUploadCount']);
+        if (sheet) {
+          // Flatten data and add rows
+          const rows = employeesData.map(emp => ({
+            ...emp,
+            office2: emp.office2 || ''
+          }));
+          await sheet.addRows(rows);
+          delete cache['employees'];
+        }
+      } catch (error) {
+        console.error('Error saving bulk employees to spreadsheet:', error);
+        return res.status(500).json({ success: false, message: `Gagal menyimpan data ke spreadsheet: ${error instanceof Error ? error.message : String(error)}` });
+      }
+    } else {
+      db.employees.push(...employeesData);
+    }
+    res.json({ success: true, message: `${employeesData.length} karyawan berhasil ditambahkan` });
+  });
+
+  app.delete('/api/employees/:id', async (req, res) => {
+    const { id } = req.params;
+    if (doc) {
+      try {
+        const sheet = await getSheet('Employees');
+        if (sheet) {
+          const rows = await sheet.getRows();
+          const rowToDelete = rows.find(r => r.get('id') === id);
+          if (rowToDelete) {
+            await rowToDelete.delete();
+            delete cache['employees'];
+          }
+        }
+      } catch (error) {
+        console.error('Error deleting employee from spreadsheet:', error);
+      }
+    } else {
+      db.employees = db.employees.filter(e => e.id !== id);
+    }
+    res.json({ success: true, message: 'Karyawan berhasil dihapus' });
+  });
+
+  app.post('/api/employees/photo', async (req, res) => {
+    const { nip, photoUrl } = req.body;
+    
+    if (!nip || !photoUrl) {
+      return res.status(400).json({ success: false, message: 'Data tidak lengkap' });
     }
 
-    const empRows = await empSheet.getRows();
-    const existing = empRows.find((r) => r.get('nip') === nipStr);
-    if (existing) {
-      return res.status(400).json({ success: false, message: 'NIP sudah terdaftar' });
+    if (doc) {
+      try {
+        const sheet = await getSheet('Employees');
+        if (sheet) {
+          const rows = await sheet.getRows();
+          const empRow = rows.find(r => String(r.get('nip')) === String(nip));
+          
+          if (empRow) {
+            const currentCount = empRow.get('photoUploadCount') ? parseInt(empRow.get('photoUploadCount'), 10) : 0;
+            if (currentCount >= 5) {
+              return res.status(400).json({ success: false, message: 'Batas unggah foto telah mencapai maksimal (5 kali).' });
+            }
+            
+            empRow.set('photoUrl', photoUrl);
+            empRow.set('photoUploadCount', String(currentCount + 1));
+            await empRow.save();
+            delete cache['employees'];
+            
+            return res.json({ 
+              success: true, 
+              message: `Foto berhasil disimpan. Sisa kesempatan: ${4 - currentCount} kali.`, 
+              photoUrl, 
+              photoUploadCount: currentCount + 1 
+            });
+          } else {
+            return res.status(404).json({ success: false, message: 'Karyawan tidak ditemukan' });
+          }
+        }
+      } catch (error) {
+        console.error('Error updating profile photo:', error);
+        return res.status(500).json({ success: false, message: 'Terjadi kesalahan sistem saat menyimpan foto.' });
+      }
+    }
+    
+    // For mock DB
+    const emp = db.employees.find((e: any) => e.nip === nip) as any;
+    if (emp) {
+      const currentCount = emp.photoUploadCount || 0;
+      if (currentCount >= 5) {
+         return res.status(400).json({ success: false, message: 'Batas unggah foto telah mencapai maksimal (5 kali).' });
+      }
+      emp.photoUrl = photoUrl;
+      emp.photoUploadCount = currentCount + 1;
+      return res.json({ 
+        success: true, 
+        message: `Foto berhasil disimpan. Sisa kesempatan: ${4 - currentCount} kali.`, 
+        photoUrl, 
+        photoUploadCount: currentCount + 1 
+      });
+    }
+    
+    res.status(404).json({ success: false, message: 'Karyawan tidak ditemukan' });
+  });
+
+  // --- Admins API ---
+  app.get('/api/admins', async (req, res) => {
+    if (doc) {
+      try {
+        const admins = await getCachedData('admins', async () => {
+          const sheet = await getOrCreateSheet('Admins', ['id', 'name', 'nip', 'email', 'phone', 'group', 'isActive', 'access', 'password']);
+          if (sheet) {
+            const rows = await sheet.getRows();
+            return rows.map(row => ({
+              id: row.get('id'),
+              name: row.get('name'),
+              nip: row.get('nip'),
+              email: row.get('email'),
+              phone: row.get('phone'),
+              group: row.get('group'),
+              isActive: String(row.get('isActive')).toLowerCase() === 'true',
+              access: row.get('access') ? JSON.parse(row.get('access')) : [],
+              password: row.get('password')
+            }));
+          }
+          return [];
+        });
+        return res.json(admins);
+      } catch (error) {
+        console.error('Error fetching admins from spreadsheet:', error);
+      }
+    }
+    res.json([]);
+  });
+
+  app.post('/api/admins', async (req, res) => {
+    const admin = req.body;
+    
+    if (doc) {
+      try {
+        const sheet = await getOrCreateSheet('Admins', ['id', 'name', 'nip', 'email', 'phone', 'group', 'isActive', 'access', 'password']);
+        if (sheet) {
+          await sheet.addRow({
+            ...admin,
+            isActive: admin.isActive.toString(),
+            access: JSON.stringify(admin.access)
+          });
+          delete cache['admins'];
+        }
+      } catch (error) {
+        console.error('Error saving admin to spreadsheet:', error);
+      }
+    }
+    res.json({ success: true, message: 'Admin berhasil ditambahkan' });
+  });
+
+  app.delete('/api/admins/:id', async (req, res) => {
+    const { id } = req.params;
+    if (doc) {
+      try {
+        const sheet = await getSheet('Admins');
+        if (sheet) {
+          const rows = await sheet.getRows();
+          const rowToDelete = rows.find(r => String(r.get('id')) === String(id));
+          if (rowToDelete) {
+            await rowToDelete.delete();
+            delete cache['admins'];
+          }
+        }
+      } catch (error) {
+        console.error('Error deleting admin from spreadsheet:', error);
+      }
+    }
+    res.json({ success: true, message: 'Admin berhasil dihapus' });
+  });
+
+  app.put('/api/admins/:id', async (req, res) => {
+    const { id } = req.params;
+    const admin = req.body;
+    if (doc) {
+      try {
+        const sheet = await getSheet('Admins');
+        if (sheet) {
+          const rows = await sheet.getRows();
+          const rowToUpdate = rows.find(r => String(r.get('id')) === String(id));
+          if (rowToUpdate) {
+            rowToUpdate.set('name', admin.name);
+            rowToUpdate.set('nip', admin.nip);
+            rowToUpdate.set('email', admin.email);
+            rowToUpdate.set('phone', admin.phone);
+            rowToUpdate.set('group', admin.group);
+            rowToUpdate.set('isActive', admin.isActive.toString());
+            rowToUpdate.set('access', JSON.stringify(admin.access));
+            if (admin.password) rowToUpdate.set('password', admin.password);
+            await rowToUpdate.save();
+            delete cache['admins'];
+          }
+        }
+      } catch (error) {
+        console.error('Error updating admin in spreadsheet:', error);
+        return res.status(500).json({ success: false, message: 'Gagal memperbarui admin di spreadsheet' });
+      }
+    }
+    res.json({ success: true, message: 'Admin berhasil diperbarui' });
+  });
+
+  // --- Auth API ---
+  app.post('/api/login', async (req, res) => {
+    const nip = (req.body.nip || '').trim();
+    const password = (req.body.password || '').trim();
+    console.log(`Login attempt for NIP: ${nip}`);
+    
+    let user = null;
+    if (doc) {
+      try {
+        // Check Admins first
+        const adminSheet = await getSheet('Admins');
+        if (adminSheet) {
+          const rows = await adminSheet.getRows();
+          const row = rows.find(r => String(r.get('nip') || '').trim() === nip && String(r.get('password') || '').trim() === password && String(r.get('isActive')).trim().toLowerCase() === 'true');
+          if (row) {
+            let access = [];
+            try {
+              access = JSON.parse(row.get('access'));
+            } catch (e) {}
+            user = { 
+              id: row.get('id'), 
+              nip: String(row.get('nip') || '').trim(), 
+              name: row.get('name'), 
+              role: 'admin',
+              group: row.get('group'),
+              access
+            };
+            console.log('Admin found:', user.name);
+          }
+        }
+
+        // If not admin, check Users
+        if (!user) {
+          const userSheet = await getSheet('Users');
+          if (userSheet) {
+            const rows = await userSheet.getRows();
+            const row = rows.find(r => String(r.get('nip') || '').trim() === nip && String(r.get('password') || '').trim() === password);
+            if (row) {
+              user = { id: row.get('id'), nip: String(row.get('nip') || '').trim(), name: row.get('name'), role: row.get('role'), office: row.get('office'), office2: row.get('office2'), unit: row.get('unit') || '' };
+              console.log('User found:', user.name);
+            }
+          }
+        }
+      } catch (error) {
+        console.error('Error logging in from spreadsheet:', error);
+        // Add more context to the error
+        console.error('Spreadsheet configuration might be invalid or sheet missing.');
+      }
+    }
+    
+    if (!user) {
+      user = db.users.find(u => u.nip === nip && u.password === password);
+      if (user) console.log('User found in mock DB:', user.name);
     }
 
-    const id = Date.now().toString();
-    await empSheet.addRow({
-      id,
-      name: name || '',
-      nip: nipStr,
-      office: desa || '',
-      office2: office2 === 'none' ? '' : office2 || '',
-      email: email || '',
-      gender: gender || '',
-      cluster: cluster || '',
-      unit: unit || '',
-      password: String(password).trim(),
-      photoUrl: '',
-      photoUploadCount: '0',
-    });
+    if (user) {
+      if (user.role !== 'admin') {
+        const deviceId = req.body.deviceId;
+        if (deviceId && doc) {
+          try {
+            const deviceSheet = await getOrCreateSheet('DeviceBindings', ['nip', 'deviceId']);
+            if (deviceSheet) {
+              const rows = await deviceSheet.getRows();
+              const existingDeviceRow = rows.find(r => r.get('deviceId') === deviceId);
+              if (existingDeviceRow && existingDeviceRow.get('nip') !== nip) {
+                return res.status(403).json({ success: false, message: 'Perangkat ini sudah digunakan oleh akun lain. Silahkan hubungi Admin untuk mereset perangkat jika fitur ini bermasalah.' });
+              }
 
-    res.json({ success: true, message: 'Pendaftaran berhasil, silakan login' });
-  } catch (err: any) {
-    console.error('Error during register:', err);
-    res.status(500).json({ success: false, message: 'Terjadi kesalahan server: ' + err.message });
-  }
-});
+              const existingNipRow = rows.find(r => r.get('nip') === nip);
+              if (existingNipRow && existingNipRow.get('deviceId') !== deviceId) {
+                return res.status(403).json({ success: false, message: 'Akun Anda terdaftar di perangkat lain. Untuk pengguna iOS/iPhone yang baru menginstall ke Layar Utama, layar utama dianggap sebagai perangkat baru. Silahkan minta Admin untuk mereset perangkat Anda di menu Karyawan.' });
+              }
 
-// Password Management
-app.post('/api/change-password', async (req, res) => {
-  try {
+              if (!existingDeviceRow && !existingNipRow) {
+                await deviceSheet.addRow({ nip, deviceId });
+              }
+            }
+          } catch (error) {
+            console.error('Error verifying device binding:', error);
+          }
+        }
+      }
+      res.json({ success: true, user });
+    } else {
+      res.status(401).json({ success: false, message: 'NIP atau Password salah' });
+    }
+  });
+
+  app.post('/api/change-password', async (req, res) => {
     const { id, role, oldPassword, newPassword } = req.body;
-    if (!newPassword || newPassword.length < 6) {
-      return res.status(400).json({ success: false, message: 'Password minimal 6 karakter' });
+    
+    if (!id || !role || !oldPassword || !newPassword) {
+      return res.status(400).json({ success: false, message: 'Data tidak lengkap' });
     }
 
-    if (role === 'admin') {
-      const adminSheet = await getSheet('Admins');
-      if (adminSheet) {
-        const rows = await adminSheet.getRows();
-        const target = rows.find((r) => r.get('id') === id);
-        if (target) {
-          if (oldPassword && target.get('password') && target.get('password') !== oldPassword) {
+    let passwordUpdated = false;
+    if (doc) {
+      try {
+        const sheetName = role === 'admin' ? 'Admins' : 'Users';
+        const sheet = await getSheet(sheetName);
+        let userNip = null;
+        if (sheet) {
+          const rows = await sheet.getRows();
+          const userRow = rows.find(r => r.get('id') === id && String(r.get('password')) === String(oldPassword));
+          
+          if (userRow) {
+            userRow.set('password', newPassword);
+            await userRow.save();
+            passwordUpdated = true;
+            userNip = userRow.get('nip'); // Capture NIP to sync with Employees
+            
+            // Sync with employees sheet
+            if (role !== 'admin' && userNip) {
+              const empSheet = await getSheet('Employees');
+              if (empSheet) {
+                const empRows = await empSheet.getRows();
+                const empRow = empRows.find(r => r.get('nip') === userNip);
+                if (empRow) {
+                  empRow.set('password', newPassword);
+                  await empRow.save();
+                }
+              }
+            }
+          } else {
             return res.status(400).json({ success: false, message: 'Password lama salah' });
           }
-          target.assign({ password: newPassword });
-          await target.save();
-          return res.json({ success: true, message: 'Password admin berhasil diubah' });
         }
+      } catch (error) {
+        console.error('Error changing password:', error);
+        return res.status(500).json({ success: false, message: 'Terjadi kesalahan sistem' });
       }
     }
 
-    const empSheet = await getSheet('Employees');
-    if (!empSheet) return res.status(500).json({ success: false, message: 'Database karyawan tidak tersedia' });
-
-    const rows = await empSheet.getRows();
-    const target = rows.find((r) => r.get('id') === id || r.get('nip') === id);
-    if (!target) {
-      return res.status(404).json({ success: false, message: 'Pengguna tidak ditemukan' });
-    }
-
-    if (oldPassword && target.get('password') && target.get('password') !== oldPassword) {
-      return res.status(400).json({ success: false, message: 'Password lama tidak cocok' });
-    }
-
-    target.assign({ password: newPassword });
-    await target.save();
-    res.json({ success: true, message: 'Password berhasil diperbarui' });
-  } catch (err: any) {
-    console.error('Error changing password:', err);
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-app.post('/api/forgot-password', async (req, res) => {
-  try {
-    const { email } = req.body;
-    if (!email) {
-      return res.status(400).json({ success: false, message: 'Email wajib diisi' });
-    }
-
-    const empSheet = await getSheet('Employees');
-    let userFound = false;
-    let userId = '';
-
-    if (empSheet) {
-      const rows = await empSheet.getRows();
-      const emp = rows.find((r) => r.get('email')?.toLowerCase() === email.toLowerCase());
-      if (emp) {
-        userFound = true;
-        userId = emp.get('id');
-      }
-    }
-
-    if (!userFound) {
-      const adminSheet = await getSheet('Admins');
-      if (adminSheet) {
-        const rows = await adminSheet.getRows();
-        const adm = rows.find((r) => r.get('email')?.toLowerCase() === email.toLowerCase());
-        if (adm) {
-          userFound = true;
-          userId = adm.get('id');
+    if (!passwordUpdated) {
+      const user = db.users.find(u => String(u.id) === String(id));
+      if (user) {
+        if (user.password === oldPassword) {
+          user.password = newPassword;
+          passwordUpdated = true;
+          // Sync with local employees db as well if mock
+          if (role !== 'admin' && user.nip) {
+            const emp = db.employees.find(e => e.nip === user.nip);
+            if (emp) {
+              (emp as any).password = newPassword;
+            }
+          }
+        } else {
+          return res.status(400).json({ success: false, message: 'Password lama salah' });
         }
+      } else {
+        return res.status(404).json({ success: false, message: 'Pengguna tidak ditemukan' });
       }
     }
 
-    if (!userFound) {
-      return res.status(404).json({ success: false, message: 'Email tidak terdaftar dalam sistem' });
+    res.json({ success: true, message: 'Password berhasil diubah' });
+  });
+
+  // --- API to Reset Device Binding ---
+  app.delete('/api/device-bindings/:nip', async (req, res) => {
+    const { nip } = req.params;
+    if (doc) {
+      try {
+        const deviceSheet = await getSheet('DeviceBindings');
+        if (deviceSheet) {
+          const rows = await deviceSheet.getRows();
+          const existingNipRow = rows.find(r => r.get('nip') === nip);
+          if (existingNipRow) {
+            await existingNipRow.delete();
+            return res.json({ success: true, message: 'Binding perangkat berhasil dihapus.' });
+          } else {
+            return res.status(404).json({ success: false, message: 'Binding perangkat tidak ditemukan.' });
+          }
+        }
+      } catch (error) {
+        console.error('Error resetting device binding:', error);
+        return res.status(500).json({ success: false, message: 'Terjadi kesalahan pada server.' });
+      }
+    }
+    return res.status(500).json({ success: false, message: 'Spreadsheet tidak terkonfigurasi.' });
+  });
+
+  app.post('/api/register', async (req, res) => {
+    const { nip, name, email, password, gender, cluster, unit, desa, office2 } = req.body;
+    
+    // 1. Validate NIP against Employees data
+    let isValidEmployee = false;
+    if (doc) {
+      try {
+        const empSheet = await getSheet('Employees');
+        if (empSheet) {
+          const rows = await empSheet.getRows();
+          isValidEmployee = rows.some(r => String(r.get('nip')) === String(nip));
+        }
+      } catch (error) {
+        console.error('Error validating employee NIP:', error);
+      }
+    }
+    
+    if (!isValidEmployee) {
+      isValidEmployee = db.employees.some(e => e.nip === nip);
     }
 
-    const token = crypto.randomUUID();
-    const resetSheet = await getSheet('PasswordResets');
-    if (resetSheet) {
-      await resetSheet.addRow({
-        token,
-        userId,
-        userType: 'user',
-        expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+    if (!isValidEmployee) {
+      return res.status(400).json({ success: false, message: 'NIP tidak terdaftar sebagai karyawan. Hubungi Admin.' });
+    }
+
+    // 2. Check if user already exists
+    let userExists = false;
+    if (doc) {
+      try {
+        const userSheet = await getOrCreateSheet('Users', ['id', 'nip', 'name', 'email', 'role', 'password', 'gender', 'cluster', 'unit', 'office', 'office2']);
+        if (userSheet) {
+          const rows = await userSheet.getRows();
+          userExists = rows.some(r => String(r.get('nip')) === String(nip));
+        }
+      } catch (error) {
+        console.error('Error checking existing user:', error);
+      }
+    } else {
+      userExists = db.users.some(u => u.nip === nip);
+    }
+
+    if (userExists) {
+      return res.status(400).json({ success: false, message: 'NIP sudah terdaftar sebagai user' });
+    }
+
+    const newUser = {
+      id: Date.now().toString(),
+      nip,
+      name,
+      email,
+      role: 'user',
+      password,
+      gender,
+      cluster,
+      unit,
+      office: desa,
+      office2: office2 || ''
+    };
+
+    // Save to Google Spreadsheet if configured
+    if (doc) {
+      try {
+        const sheet = await getOrCreateSheet('Users', ['id', 'nip', 'name', 'email', 'role', 'password', 'gender', 'cluster', 'unit', 'office', 'office2']);
+        if (sheet) {
+          await sheet.addRow(newUser);
+        }
+      } catch (error) {
+        console.error('Error saving user to spreadsheet:', error);
+      }
+    } else {
+      db.users.push(newUser as any);
+    }
+
+    res.json({ success: true, message: 'Pendaftaran berhasil' });
+  });
+
+  app.get('/api/time', (req, res) => {
+    // Return server time for client synchronization
+    // Use Asia/Jakarta explicitly if needed, but returning timestamp is enough
+    res.json({ timestamp: Date.now() });
+  });
+
+  // --- Attendance API ---
+  app.get('/api/attendance', async (req, res) => {
+        const { startDate, endDate } = req.query;
+    
+    let allAttendance: any[] = [];
+    if (doc) {
+      try {
+        allAttendance = await getCachedData('attendance', async () => {
+          const sheet = await getOrCreateSheet('Attendance', ['id', 'nip', 'name', 'date', 'time', 'type', 'location', 'status', 'photoUrl', 'shift']);
+          if (sheet) {
+            const rows = await sheet.getRows();
+            return rows.map(row => ({
+              id: row.get('id'),
+              nip: row.get('nip'),
+              name: row.get('name'),
+              date: row.get('date'),
+              time: row.get('time'),
+              type: row.get('type'),
+              location: (() => {
+                try { return JSON.parse(row.get('location')); }
+                catch (e) { return row.get('location'); }
+              })(),
+              status: row.get('status'),
+              photoUrl: row.get('photoUrl') && row.get('photoUrl').startsWith('data:image') 
+                ? `/api/attendance/${row.get('id')}/photo`
+                : (row.get('photoUrl') || ''),
+              shift: row.get('shift')
+            }));
+          }
+          return [];
+        });
+      } catch (error) {
+        console.error('Error fetching attendance from spreadsheet:', error);
+      }
+    } else {
+      allAttendance = db.attendance;
+    }
+
+    const filterByDateRange = (start: string, end: string) => {
+      return allAttendance.filter(a => {
+        const aStart = a.date;
+        const aEnd = (a.location && typeof a.location === 'object' && a.location.endDate) ? a.location.endDate : a.date;
+        return aStart <= end && aEnd >= start;
+      });
+    };
+
+    let filteredAttendance = allAttendance;
+    if (startDate && endDate) {
+      filteredAttendance = filterByDateRange(startDate as string, endDate as string);
+    } else {
+      // Default to last month and current month if no range given 
+      const today = new Date();
+      const prevMonthObj = new Date(today.getFullYear(), today.getMonth() - 1, 1);
+      const firstDay = `${prevMonthObj.getFullYear()}-${String(prevMonthObj.getMonth() + 1).padStart(2, '0')}-01`;
+      
+      const nextMonthObj = new Date(today.getFullYear(), today.getMonth() + 1, 0);
+      const nextMonthEnd = `${nextMonthObj.getFullYear()}-${String(nextMonthObj.getMonth() + 1).padStart(2, '0')}-${String(nextMonthObj.getDate()).padStart(2, '0')}`;
+      filteredAttendance = filterByDateRange(firstDay, nextMonthEnd);
+    }
+
+    return res.json(filteredAttendance);
+  });
+
+
+  app.get('/api/attendance/:id/photo', async (req, res) => {
+    try {
+      const sheet = await getOrCreateSheet('Attendance', ['id', 'nip', 'name', 'date', 'time', 'type', 'location', 'status', 'photoUrl', 'shift']);
+      if (!sheet) return res.status(500).send('Database unavailable');
+      
+      const rows = await sheet.getRows();
+      const targetRow = rows.find(row => row.get('id') === req.params.id);
+      
+      if (!targetRow) return res.status(404).send('Not found');
+      
+      const photoUrl = targetRow.get('photoUrl');
+      if (!photoUrl || !photoUrl.startsWith('data:image')) {
+        return res.status(404).send('No image for this record');
+      }
+      
+      // photoUrl format is usually like: data:image/jpeg;base64,/9j/4AAQ...
+      const matches = photoUrl.match(/^data:([A-Za-z-+\/]+);base64,(.+)$/);
+      if (!matches || matches.length !== 3) {
+         return res.status(400).send('Invalid image data');
+      }
+      
+      const mimeType = matches[1];
+      const buffer = Buffer.from(matches[2], 'base64');
+      
+      res.set('Content-Type', mimeType);
+      res.send(buffer);
+    } catch (e) {
+      console.error(e);
+      res.status(500).send('Internal error');
+    }
+  });
+
+  app.post('/api/attendance', async (req, res) => {
+    const attendanceData = req.body;
+    // attendanceData: { nip, name, date, time, type, location, status, photoUrl }
+    
+    // Prevent overriding timezone from client. Enforce Server Time (Asia/Jakarta)
+    if (attendanceData.type === 'in' || attendanceData.type === 'out') {
+      const now = new Date();
+      
+      const timeFormatter = new Intl.DateTimeFormat('id-ID', { timeZone: 'Asia/Jakarta', hour: '2-digit', minute: '2-digit', hour12: false });
+      let serverTimeStr = timeFormatter.format(now).replace('.', ':');
+      attendanceData.time = serverTimeStr;
+
+      if (attendanceData.type === 'in') {
+        const dateFormatter = new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Jakarta', year: 'numeric', month: '2-digit', day: '2-digit' });
+        const parts = dateFormatter.formatToParts(now);
+        const year = parts.find(p => p.type === 'year')?.value;
+        const month = parts.find(p => p.type === 'month')?.value;
+        const day = parts.find(p => p.type === 'day')?.value;
+        attendanceData.date = `${year}-${month}-${day}`;
+      }
+    }
+
+    if (doc) {
+      try {
+        const sheet = await getOrCreateSheet('Attendance', ['id', 'nip', 'name', 'date', 'time', 'type', 'location', 'status', 'photoUrl']);
+        if (sheet) {
+          // Google Sheets cell limit is 50,000 characters.
+          // Base64 images can easily exceed this.
+          let photoUrlToSave = attendanceData.photoUrl || '';
+          if (photoUrlToSave.length > 49000) {
+             // If it's too large, we can't save the full image in a single cell.
+             // Ideally, save to cloud storage and store URL. For now, truncate or store a placeholder.
+             photoUrlToSave = 'Image too large to save in spreadsheet';
+             console.warn('Attendance photoUrl exceeded 50000 characters, replacing with placeholder.');
+          }
+
+          await sheet.addRow({
+            id: Date.now().toString(),
+            ...attendanceData,
+            photoUrl: photoUrlToSave,
+            location: typeof attendanceData.location === 'object' ? JSON.stringify(attendanceData.location) : attendanceData.location
+          });
+          delete cache['attendance'];
+        }
+      } catch (error) {
+        console.error('Error saving attendance to spreadsheet:', error);
+        return res.status(500).json({ success: false, message: 'Gagal menyimpan absensi ke spreadsheet. Mungkin ukuran foto terlalu besar.' });
+      }
+    } else {
+      db.attendance.push({ id: Date.now().toString(), ...attendanceData } as any);
+    }
+
+    res.json({ success: true, message: 'Absensi berhasil dicatat' });
+  });
+
+  app.post('/api/attendance/bulk', async (req, res) => {
+    const { records } = req.body;
+    if (!Array.isArray(records) || records.length === 0) {
+      return res.json({ success: true, message: 'No records to add' });
+    }
+    
+    if (doc) {
+      try {
+        const sheet = await getOrCreateSheet('Attendance', ['id', 'nip', 'name', 'date', 'time', 'type', 'location', 'status', 'photoUrl', 'shift']);
+        if (sheet) {
+          const rowsToAdd = records.map((attendanceData: any, index: number) => ({
+            id: (Date.now() + index).toString(),
+            ...attendanceData,
+            photoUrl: attendanceData.photoUrl || '',
+            location: typeof attendanceData.location === 'object' ? JSON.stringify(attendanceData.location) : attendanceData.location
+          }));
+          await sheet.addRows(rowsToAdd);
+          delete cache['attendance'];
+        }
+      } catch (error) {
+        console.error('Error saving bulk attendance:', error);
+        return res.status(500).json({ success: false, message: 'Gagal menyimpan bulk absensi.' });
+      }
+    } else {
+      records.forEach((rec: any, i: number) => {
+        db.attendance.push({ id: (Date.now() + i).toString(), ...rec } as any);
       });
     }
 
-    const origin = req.headers.origin || `${req.protocol}://${req.get('host')}`;
-    const resetLink = `${origin}/reset-password?token=${token}`;
+    res.json({ success: true, message: 'Bulk absensi berhasil dicatat' });
+  });
 
-    const resend = getResend();
+  app.post('/api/attendance/auto-checkout-check', async (req, res) => {
+    if (!doc) return res.json({ success: true, fixedCount: 0 });
+
+    try {
+      // Get necessary data
+      const [attSheet, empSheet, shiftSheet] = await Promise.all([
+        getOrCreateSheet('Attendance', ['id', 'nip', 'name', 'date', 'time', 'type', 'location', 'status', 'photoUrl', 'shift']),
+        getOrCreateSheet('Employees', ['id', 'name', 'nip', 'office', 'office2', 'email', 'gender', 'cluster', 'unit', 'password', 'photoUrl', 'photoUploadCount']),
+        getOrCreateSheet('Shifts', ['id', 'name', 'startTime', 'endTime', 'fridayEndTime', 'saturdayEndTime', 'checkInBeforeMinutes', 'checkInAfterMinutes', 'checkOutBeforeMinutes', 'checkOutAfterMinutes', 'crossesMidnight', 'isActive', 'unit', 'isOffSunday', 'isOffHoliday'])
+      ]);
+
+      if (!attSheet || !empSheet || !shiftSheet) return res.json({ success: false });
+
+      const [attRows, empRows, shiftRows] = await Promise.all([
+        attSheet.getRows(),
+        empSheet.getRows(),
+        shiftSheet.getRows()
+      ]);
+
+      const attendance = attRows.map(r => ({
+        nip: r.get('nip'), name: r.get('name'), date: r.get('date'),
+        time: r.get('time'), type: r.get('type'), location: r.get('location'),
+        status: r.get('status'), shift: r.get('shift') || ''
+      }));
+
+      const employees = empRows.map(r => ({ nip: r.get('nip'), unit: r.get('unit') }));
+      const shifts = shiftRows.map(r => ({
+        name: r.get('name'), startTime: r.get('startTime'), endTime: r.get('endTime'),
+        fridayEndTime: r.get('fridayEndTime') || '', saturdayEndTime: r.get('saturdayEndTime') || '',
+        checkOutAfterMinutes: parseInt(r.get('checkOutAfterMinutes') || '120'),
+        crossesMidnight: String(r.get('crossesMidnight')).toLowerCase() === 'true',
+        isActive: String(r.get('isActive')).toLowerCase() === 'true',
+        unit: r.get('unit') || ''
+      }));
+
+      // Find 'in' records without 'out' records
+      const inRecords = attendance.filter(a => a.type === 'in');
+      const outRecords = attendance.filter(a => a.type === 'out');
+      const now = new Date();
+      
+      const missingOuts = [];
+
+      for (const inRec of inRecords) {
+        if (outRecords.some(o => o.nip === inRec.nip && o.date === inRec.date)) continue;
+
+        // Determine this record's shift
+        let targetShift = shifts.find(s => s.name === inRec.shift);
+        if (!targetShift) {
+          const empUnit = employees.find(e => e.nip === inRec.nip)?.unit || '';
+          const activeShifts = shifts.filter(s => s.isActive);
+          const specificShifts = activeShifts.filter(s => s.unit && s.unit === empUnit);
+          // Simplified fallback: pick first matching shift or first overall
+          targetShift = specificShifts[0] || activeShifts.filter(s => !s.unit || s.unit === 'none' || s.unit === '')[0] || shifts[0];
+        }
+
+        if (!targetShift) continue;
+
+        // Determine correct end time based on day of week
+        const recDateObj = new Date(inRec.date);
+        const isFriday = recDateObj.getDay() === 5;
+        const isSaturday = recDateObj.getDay() === 6;
+        let endTimeStr = targetShift.endTime;
+        if (isFriday && targetShift.fridayEndTime) endTimeStr = targetShift.fridayEndTime;
+        if (isSaturday && targetShift.saturdayEndTime) endTimeStr = targetShift.saturdayEndTime;
+
+        if (!endTimeStr) continue;
+
+        // Construct absolute end time limit
+        const [endHr, endMin] = endTimeStr.split(':').map(Number);
+        const endDateTime = new Date(inRec.date);
+        endDateTime.setHours(endHr, endMin, 0, 0);
+
+        if (targetShift.crossesMidnight) {
+          endDateTime.setDate(endDateTime.getDate() + 1);
+        }
+
+        // Add tolerance
+        endDateTime.setMinutes(endDateTime.getMinutes() + targetShift.checkOutAfterMinutes);
+
+        // If 'now' is past the maximum allowed checkout time, auto-checkout
+        if (now > endDateTime) {
+          const autoCheckoutHour = (endHr - 1 + 24) % 24;
+          const autoCheckoutTimeStr = `${autoCheckoutHour.toString().padStart(2, '0')}:${endMin.toString().padStart(2, '0')}`;
+
+          missingOuts.push({
+            id: (Date.now() + missingOuts.length).toString(),
+            nip: inRec.nip,
+            name: inRec.name,
+            date: inRec.date,
+            time: autoCheckoutTimeStr,
+            type: 'out',
+            location: inRec.location,
+            status: 'Hadir (Pulang Cepat)',
+            photoUrl: '', // Auto checkout has no photo
+            shift: targetShift.name
+          });
+        }
+      }
+
+      if (missingOuts.length > 0) {
+        await attSheet.addRows(missingOuts);
+        delete cache['attendance'];
+        return res.json({ success: true, fixedCount: missingOuts.length });
+      }
+
+      return res.json({ success: true, fixedCount: 0 });
+
+    } catch (error) {
+      console.error('Error auto-checkout:', error);
+      return res.status(500).json({ success: false, message: 'Gagal auto-checkout' });
+    }
+  });
+  
+  app.put('/api/attendance/:id', async (req, res) => {
+    const { id } = req.params;
+    const { status } = req.body;
+    if (doc) {
+      try {
+        const sheet = await getSheet('Attendance');
+        if (sheet) {
+          const rows = await sheet.getRows();
+          const rowToUpdate = rows.find(r => r.get('id') === id);
+          if (rowToUpdate) {
+            rowToUpdate.set('status', status);
+            await rowToUpdate.save();
+            delete cache['attendance'];
+            return res.json({ success: true, message: 'Status berhasil diperbarui' });
+          } else {
+            return res.status(404).json({ success: false, message: 'Absensi tidak ditemukan' });
+          }
+        }
+      } catch (error) {
+        console.error('Error updating attendance status:', error);
+        return res.status(500).json({ success: false, message: 'Terjadi kesalahan' });
+      }
+    }
+    
+    // In-memory fallback
+    const record = db.attendance.find((a: any) => a.id === id);
+    if (record) {
+      record.status = status;
+      return res.json({ success: true, message: 'Status berhasil diperbarui' });
+    }
+    return res.status(404).json({ success: false, message: 'Absensi tidak ditemukan' });
+  });
+
+  app.post('/api/forgot-password', async (req, res) => {
+    const { email } = req.body;
+    let foundUser = null;
+    let userType = '';
+
+    if (doc) {
+      try {
+        // Check Admins
+        const adminSheet = await getSheet('Admins');
+        if (adminSheet) {
+          const rows = await adminSheet.getRows();
+          const admin = rows.find(r => r.get('email') === email);
+          if (admin) {
+            foundUser = { id: admin.get('id'), name: admin.get('name'), email: admin.get('email') };
+            userType = 'admin';
+          }
+        }
+
+        // Check Employees if not found
+        if (!foundUser) {
+          const empSheet = await getSheet('Employees');
+          if (empSheet) {
+            const rows = await empSheet.getRows();
+            const emp = rows.find(r => r.get('email') === email);
+            if (emp) {
+              foundUser = { id: emp.get('id'), name: emp.get('name'), email: emp.get('email') };
+              userType = 'employee';
+            }
+          }
+        }
+        
+        // Check Users if not found
+        if (!foundUser) {
+          const userSheet = await getSheet('Users');
+          if (userSheet) {
+            const rows = await userSheet.getRows();
+            const user = rows.find(r => r.get('email') === email);
+            if (user) {
+              foundUser = { id: user.get('id'), name: user.get('name'), email: user.get('email') };
+              userType = 'user';
+            }
+          }
+        }
+      } catch (error) {
+        console.error('Error checking email in spreadsheet:', error);
+      }
+    }
+
+    if (!foundUser) {
+      const user = db.users.find(u => u.email === email);
+      if (user) {
+        foundUser = user;
+        userType = 'user';
+      } else {
+        const emp = db.employees.find(e => e.email === email);
+        if (emp) {
+          foundUser = emp;
+          userType = 'employee';
+        }
+      }
+    }
+
+    if (!foundUser) {
+      // Return success anyway to prevent email enumeration
+      return res.json({ success: true, message: 'Jika email terdaftar, tautan reset telah dikirim.' });
+    }
+
+    // Generate a simple token (in a real app, use a secure random token and save it to DB with expiration)
+    const token = Buffer.from(`${foundUser.id}:${userType}:${Date.now()}`).toString('base64');
+    
+    // Save token to spreadsheet
+    if (doc) {
+      try {
+        const resetSheet = await getOrCreateSheet('PasswordResets', ['token', 'userId', 'userType', 'expiresAt']);
+        if (resetSheet) {
+          await resetSheet.addRow({
+            token,
+            userId: foundUser.id,
+            userType,
+            expiresAt: Date.now() + 3600000 // 1 hour
+          });
+        }
+      } catch (error) {
+        console.error('Error saving reset token:', error);
+      }
+    }
+
+    const resetLink = `${process.env.APP_URL || 'http://localhost:3000'}/reset-password?token=${token}`;
+
     if (resend) {
       try {
         await resend.emails.send({
-          from: 'Si Abon Elite <onboarding@resend.dev>',
-          to: email,
-          subject: 'Reset Password - Si Abon Elite App',
-          html: `<p>Halo,</p><p>Anda meminta untuk mereset password akun Si Abon Elite. Klik tautan berikut untuk membuat password baru:</p><p><a href="${resetLink}">Reset Password</a></p><p>Tautan ini berlaku selama 1 jam.</p>`,
+          from: 'Si Abon Megilan <noreplay@siabonmegilan.qzz.io>',
+          to: foundUser.email,
+          subject: 'Reset Password - Si Abon Megilan',
+          html: `<p>Halo ${foundUser.name},</p><p>Klik tautan berikut untuk mereset password Anda:</p><p><a href="${resetLink}">${resetLink}</a></p><p>Tautan ini akan kedaluwarsa dalam 1 jam.</p>`,
         });
-      } catch (emailErr) {
-        console.warn('Resend delivery error, returning mock link fallback:', emailErr);
+      } catch (error) {
+        console.error('Error sending email via Resend:', error);
+        return res.status(500).json({ success: false, message: 'Gagal mengirim email. Pastikan API Key Resend valid.' });
       }
+    } else {
+      console.log(`[MOCK EMAIL] To: ${foundUser.email}, Subject: Reset Password, Link: ${resetLink}`);
+      // For testing without Resend API key, we return the link in the response (only in dev!)
+      return res.json({ success: true, message: 'Email reset password telah dikirim (Mock Mode)', mockLink: resetLink });
     }
 
-    res.json({
-      success: true,
-      message: 'Email reset password telah dikirim',
-      mockLink: resetLink,
-    });
-  } catch (err: any) {
-    console.error('Error handling forgot password:', err);
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
+    res.json({ success: true, message: 'Email reset password telah dikirim' });
+  });
 
-app.post('/api/reset-password', async (req, res) => {
-  try {
+  app.post('/api/reset-password', async (req, res) => {
     const { token, newPassword } = req.body;
+    
     if (!token || !newPassword) {
       return res.status(400).json({ success: false, message: 'Token dan password baru wajib diisi' });
     }
 
-    const resetSheet = await getSheet('PasswordResets');
-    if (!resetSheet) {
-      return res.status(500).json({ success: false, message: 'Password resets sheet tidak tersedia' });
-    }
+    let userId = '';
+    let userType = '';
+    let isValidToken = false;
 
-    const rows = await resetSheet.getRows();
-    const targetReset = rows.find((r) => r.get('token') === token);
-    if (!targetReset) {
-      return res.status(400).json({ success: false, message: 'Token reset tidak valid atau telah digunakan' });
-    }
-
-    const expiresAt = targetReset.get('expiresAt');
-    if (expiresAt && new Date(expiresAt).getTime() < Date.now()) {
-      await targetReset.delete();
-      return res.status(400).json({ success: false, message: 'Token reset telah kedaluwarsa' });
-    }
-
-    const userId = targetReset.get('userId');
-    const empSheet = await getSheet('Employees');
-    let updated = false;
-
-    if (empSheet) {
-      const empRows = await empSheet.getRows();
-      const emp = empRows.find((r) => r.get('id') === userId);
-      if (emp) {
-        emp.assign({ password: newPassword });
-        await emp.save();
-        updated = true;
+    if (doc) {
+      try {
+        const resetSheet = await getSheet('PasswordResets');
+        if (resetSheet) {
+          const rows = await resetSheet.getRows();
+          const tokenRow = rows.find(r => r.get('token') === token);
+          
+          if (tokenRow) {
+            const expiresAt = parseInt(tokenRow.get('expiresAt'));
+            if (Date.now() > expiresAt) {
+              return res.status(400).json({ success: false, message: 'Token reset password telah kedaluwarsa' });
+            }
+            userId = tokenRow.get('userId');
+            userType = tokenRow.get('userType');
+            isValidToken = true;
+            
+            // Delete used token
+            await tokenRow.delete();
+          }
+        }
+      } catch (error) {
+        console.error('Error verifying token:', error);
       }
     }
 
-    if (!updated) {
-      const adminSheet = await getSheet('Admins');
-      if (adminSheet) {
-        const admRows = await adminSheet.getRows();
-        const adm = admRows.find((r) => r.get('id') === userId);
-        if (adm) {
-          adm.assign({ password: newPassword });
-          await adm.save();
-          updated = true;
+    // Fallback to decoding token if not using spreadsheet (for mock DB)
+    if (!isValidToken) {
+      try {
+        const decoded = Buffer.from(token, 'base64').toString('utf-8');
+        const parts = decoded.split(':');
+        if (parts.length === 3) {
+          userId = parts[0];
+          userType = parts[1];
+          const timestamp = parseInt(parts[2]);
+          if (Date.now() - timestamp < 3600000) {
+            isValidToken = true;
+          } else {
+            return res.status(400).json({ success: false, message: 'Token reset password telah kedaluwarsa' });
+          }
+        }
+      } catch (e) {
+        return res.status(400).json({ success: false, message: 'Token tidak valid' });
+      }
+    }
+
+    if (!isValidToken) {
+      return res.status(400).json({ success: false, message: 'Token tidak valid' });
+    }
+
+    // Update password
+    let passwordUpdated = false;
+    if (doc) {
+      try {
+        let sheetName = '';
+        if (userType === 'admin') sheetName = 'Admins';
+        else if (userType === 'employee') sheetName = 'Employees';
+        else if (userType === 'user') sheetName = 'Users';
+
+        if (sheetName) {
+          const sheet = await getSheet(sheetName);
+          if (sheet) {
+            const rows = await sheet.getRows();
+            const userRow = rows.find(r => r.get('id') === userId);
+            if (userRow) {
+              userRow.set('password', newPassword);
+              await userRow.save();
+              passwordUpdated = true;
+              
+              if (userType === 'user') {
+                const userNip = userRow.get('nip');
+                if (userNip) {
+                  const empSheet = await getSheet('Employees');
+                  if (empSheet) {
+                    const empRows = await empSheet.getRows();
+                    const empRow = empRows.find(r => r.get('nip') === userNip);
+                    if (empRow) {
+                      empRow.set('password', newPassword);
+                      await empRow.save();
+                    }
+                  }
+                }
+              }
+                 
+              // Clear cache
+              if (sheetName === 'Admins') delete cache['admins'];
+              if (sheetName === 'Employees') delete cache['employees'];
+            }
+          }
+        }
+      } catch (error) {
+        console.error('Error updating password:', error);
+        return res.status(500).json({ success: false, message: 'Gagal memperbarui password' });
+      }
+    }
+
+    if (!passwordUpdated) {
+      // Update mock DB
+      if (userType === 'admin' || userType === 'user') {
+        const user = db.users.find(u => u.id.toString() === userId);
+        if (user) {
+          user.password = newPassword;
+          passwordUpdated = true;
+        }
+      } else if (userType === 'employee') {
+        const emp = db.employees.find(e => e.id === userId);
+        if (emp) {
+          (emp as any).password = newPassword;
+          passwordUpdated = true;
         }
       }
     }
 
-    await targetReset.delete();
-
-    if (!updated) {
-      return res.status(404).json({ success: false, message: 'Pengguna terkait token tidak ditemukan' });
+    if (passwordUpdated) {
+      res.json({ success: true, message: 'Password berhasil diperbarui' });
+    } else {
+      res.status(404).json({ success: false, message: 'Pengguna tidak ditemukan' });
     }
+  });
 
-    res.json({ success: true, message: 'Password berhasil diperbarui' });
-  } catch (err: any) {
-    console.error('Error resetting password:', err);
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
+  app.get('/api/users', (req, res) => {
+    res.json(db.users.map(u => ({ id: u.id, nip: u.nip, name: u.name, role: u.role })));
+  });
 
-// ==========================================
-// VITE SPA & STATIC SERVING
-// ==========================================
-async function start() {
+  // --- Locations API ---
+  app.get('/api/locations', async (req, res) => {
+    if (doc) {
+      try {
+        const locations = await getCachedData('locations', async () => {
+          const sheet = await getOrCreateSheet('Locations', ['id', 'name', 'desa', 'kecamatan', 'kabupaten', 'coordinates', 'radius']);
+          if (sheet) {
+            const rows = await sheet.getRows();
+            return rows.map(row => ({
+              id: row.get('id'),
+              desa: row.get('desa') || row.get('name') || '',
+              kecamatan: row.get('kecamatan') || '',
+              kabupaten: row.get('kabupaten') || '',
+              coordinates: row.get('coordinates'),
+              radius: row.get('radius') || 250
+            }));
+          }
+          return [];
+        });
+        return res.json(locations);
+      } catch (error) {
+        console.error('Error fetching locations from spreadsheet:', error);
+      }
+    }
+    res.json([
+      { id: "1", desa: "Kantor Induk", kecamatan: "", kabupaten: "", coordinates: "-7.1234, 112.1234", radius: 250 },
+      { id: "2", desa: "Pustu A", kecamatan: "", kabupaten: "", coordinates: "-7.1235, 112.1235", radius: 250 }
+    ]);
+  });
+
+  app.post('/api/locations', async (req, res) => {
+    const location = req.body;
+    if (doc) {
+      try {
+        const sheet = await getOrCreateSheet('Locations', ['id', 'name', 'desa', 'kecamatan', 'kabupaten', 'coordinates', 'radius']);
+        if (sheet) {
+          await sheet.addRow({
+            id: Date.now().toString(),
+            name: location.desa || '',
+            desa: location.desa || '',
+            kecamatan: location.kecamatan || '',
+            kabupaten: location.kabupaten || '',
+            coordinates: location.coordinates || '',
+            radius: location.radius || 250
+          });
+          delete cache['locations'];
+        }
+      } catch (error) {
+        console.error('Error saving location to spreadsheet:', error);
+      }
+    }
+    res.json({ success: true, message: 'Lokasi berhasil ditambahkan' });
+  });
+
+  app.delete('/api/locations/:id', async (req, res) => {
+    const { id } = req.params;
+    if (doc) {
+      try {
+        const sheet = await getSheet('Locations');
+        if (sheet) {
+          const rows = await sheet.getRows();
+          const rowToDelete = rows.find(r => String(r.get('id')) === String(id));
+          if (rowToDelete) {
+            await rowToDelete.delete();
+            delete cache['locations'];
+          }
+        }
+      } catch (error) {
+        console.error('Error deleting location from spreadsheet:', error);
+      }
+    }
+    res.json({ success: true, message: 'Lokasi berhasil dihapus' });
+  });
+
+// --- Units API ---
+  app.get('/api/units', async (req, res) => {
+    if (doc) {
+      try {
+        const units = await getCachedData('units', async () => {
+          const sheet = await getOrCreateSheet('Units', ['id', 'name']);
+          if (sheet) {
+            const rows = await sheet.getRows();
+            return rows.map(row => ({
+              id: row.get('id'),
+              name: row.get('name')
+            }));
+          }
+          return [];
+        });
+        return res.json(units);
+      } catch (error) {
+        console.error('Error fetching units:', error);
+      }
+    }
+    res.json((db as any).units || []);
+  });
+
+  app.post('/api/units', async (req, res) => {
+    const unit = req.body;
+    if (doc) {
+      try {
+        const sheet = await getOrCreateSheet('Units', ['id', 'name']);
+        if (sheet) {
+          if (unit.id) {
+            const rows = await sheet.getRows();
+            const existingRow = rows.find(r => r.get('id') === unit.id);
+            if (existingRow) {
+              existingRow.set('name', unit.name || '');
+              await existingRow.save();
+            } else {
+              await sheet.addRow(unit);
+            }
+          } else {
+            unit.id = Date.now().toString();
+            await sheet.addRow(unit);
+          }
+          delete cache['units'];
+        }
+      } catch (error) {
+        console.error('Error saving unit:', error);
+      }
+    } else {
+      unit.id = unit.id || Date.now().toString();
+      if (!(db as any).units) (db as any).units = [];
+      const index = (db as any).units.findIndex((u: any) => u.id === unit.id);
+      if (index >= 0) (db as any).units[index] = unit;
+      else (db as any).units.push(unit);
+    }
+    res.json({ success: true, message: 'Unit berhasil disimpan' });
+  });
+
+  app.delete('/api/units/:id', async (req, res) => {
+    const { id } = req.params;
+    if (doc) {
+      try {
+        const sheet = await getSheet('Units');
+        if (sheet) {
+          const rows = await sheet.getRows();
+          const rowToDelete = rows.find(r => String(r.get('id')) === String(id));
+          if (rowToDelete) {
+            await rowToDelete.delete();
+            delete cache['units'];
+          }
+        }
+      } catch (error) {
+        console.error('Error deleting unit:', error);
+      }
+    } else {
+       if ((db as any).units) (db as any).units = (db as any).units.filter((u: any) => u.id !== id);
+    }
+    res.json({ success: true, message: 'Unit berhasil dihapus' });
+  });
+
+  // --- Shifts API ---
+  app.get('/api/shifts', async (req, res) => {
+    if (doc) {
+      try {
+        const shifts = await getCachedData('shifts', async () => {
+          const sheet = await getOrCreateSheet('Shifts', ['id', 'name', 'startTime', 'endTime', 'fridayEndTime', 'saturdayEndTime', 'checkInBeforeMinutes', 'checkInAfterMinutes', 'checkOutBeforeMinutes', 'checkOutAfterMinutes', 'crossesMidnight', 'isActive', 'unit', 'isOffSunday', 'isOffHoliday']);
+          if (sheet) {
+            const rows = await sheet.getRows();
+            return rows.map(row => ({
+              id: row.get('id'),
+              name: row.get('name'),
+              startTime: row.get('startTime'),
+              endTime: row.get('endTime'),
+              fridayEndTime: row.get('fridayEndTime') || '',
+              saturdayEndTime: row.get('saturdayEndTime') || '',
+              checkInBeforeMinutes: parseInt(row.get('checkInBeforeMinutes') || '60'),
+              checkInAfterMinutes: parseInt(row.get('checkInAfterMinutes') || '15'),
+              checkOutBeforeMinutes: parseInt(row.get('checkOutBeforeMinutes') || '10'),
+              checkOutAfterMinutes: parseInt(row.get('checkOutAfterMinutes') || '120'),
+              crossesMidnight: String(row.get('crossesMidnight')).toLowerCase() === 'true',
+              isActive: String(row.get('isActive')).toLowerCase() === 'true',
+              unit: row.get('unit') || '',
+              isOffSunday: String(row.get('isOffSunday')).toLowerCase() === 'true',
+              isOffHoliday: String(row.get('isOffHoliday')).toLowerCase() === 'true'
+            }));
+          }
+          return [];
+        });
+        return res.json(shifts);
+      } catch (error) {
+        console.error('Error fetching shifts from spreadsheet:', error);
+      }
+    }
+    res.json([
+      { id: "1", name: "Pagi", startTime: "08:00", endTime: "16:00", fridayEndTime: "10:50", saturdayEndTime: "12:30", checkInBeforeMinutes: 60, checkInAfterMinutes: 15, checkOutBeforeMinutes: 10, checkOutAfterMinutes: 120, crossesMidnight: false, isActive: true, unit: "" },
+      { id: "2", name: "Malam", startTime: "20:00", endTime: "04:00", fridayEndTime: "", saturdayEndTime: "", checkInBeforeMinutes: 60, checkInAfterMinutes: 15, checkOutBeforeMinutes: 10, checkOutAfterMinutes: 120, crossesMidnight: true, isActive: true, unit: "" }
+    ]);
+  });
+
+  app.post('/api/shifts', async (req, res) => {
+    const shift = req.body;
+    if (doc) {
+      try {
+        const sheet = await getOrCreateSheet('Shifts', ['id', 'name', 'startTime', 'endTime', 'fridayEndTime', 'saturdayEndTime', 'checkInBeforeMinutes', 'checkInAfterMinutes', 'checkOutBeforeMinutes', 'checkOutAfterMinutes', 'crossesMidnight', 'isActive', 'unit', 'isOffSunday', 'isOffHoliday']);
+        if (sheet) {
+          await sheet.addRow({
+            ...shift,
+            checkInBeforeMinutes: (shift.checkInBeforeMinutes || 60).toString(),
+            checkInAfterMinutes: (shift.checkInAfterMinutes || 15).toString(),
+            checkOutBeforeMinutes: (shift.checkOutBeforeMinutes || 10).toString(),
+            checkOutAfterMinutes: (shift.checkOutAfterMinutes || 120).toString(),
+            crossesMidnight: shift.crossesMidnight.toString(),
+            isActive: shift.isActive.toString(),
+            unit: shift.unit || '',
+            isOffSunday: (shift.isOffSunday || false).toString(),
+            isOffHoliday: (shift.isOffHoliday || false).toString()
+          });
+          delete cache['shifts'];
+        }
+      } catch (error) {
+        console.error('Error saving shift to spreadsheet:', error);
+      }
+    }
+    res.json({ success: true, message: 'Shift berhasil ditambahkan' });
+  });
+
+  app.delete('/api/shifts/:id', async (req, res) => {
+    const { id } = req.params;
+    if (doc) {
+      try {
+        const sheet = await getSheet('Shifts');
+        if (sheet) {
+          const rows = await sheet.getRows();
+          const rowToDelete = rows.find(r => r.get('id') === id);
+          if (rowToDelete) {
+            await rowToDelete.delete();
+            delete cache['shifts'];
+          }
+        }
+      } catch (error) {
+        console.error('Error deleting shift from spreadsheet:', error);
+      }
+    }
+    res.json({ success: true, message: 'Shift berhasil dihapus' });
+  });
+
+  app.put('/api/shifts/:id', async (req, res) => {
+    const { id } = req.params;
+    const shift = req.body;
+    if (doc) {
+      try {
+        const sheet = await getSheet('Shifts');
+        if (sheet) {
+          const rows = await sheet.getRows();
+          const rowToUpdate = rows.find(r => String(r.get('id')) === String(id));
+          if (rowToUpdate) {
+            rowToUpdate.set('name', shift.name);
+            rowToUpdate.set('startTime', shift.startTime);
+            rowToUpdate.set('endTime', shift.endTime);
+            rowToUpdate.set('fridayEndTime', shift.fridayEndTime || '');
+            rowToUpdate.set('saturdayEndTime', shift.saturdayEndTime || '');
+            rowToUpdate.set('checkInBeforeMinutes', (shift.checkInBeforeMinutes || 60).toString());
+            rowToUpdate.set('checkInAfterMinutes', (shift.checkInAfterMinutes || 15).toString());
+            rowToUpdate.set('checkOutBeforeMinutes', (shift.checkOutBeforeMinutes || 10).toString());
+            rowToUpdate.set('checkOutAfterMinutes', (shift.checkOutAfterMinutes || 120).toString());
+            rowToUpdate.set('crossesMidnight', shift.crossesMidnight.toString());
+            rowToUpdate.set('isActive', shift.isActive.toString());
+            rowToUpdate.set('unit', shift.unit || '');
+            rowToUpdate.set('isOffSunday', (shift.isOffSunday || false).toString());
+            rowToUpdate.set('isOffHoliday', (shift.isOffHoliday || false).toString());
+            await rowToUpdate.save();
+            delete cache['shifts'];
+          }
+        }
+      } catch (error) {
+        console.error('Error updating shift in spreadsheet:', error);
+        return res.status(500).json({ success: false, message: 'Gagal memperbarui shift di spreadsheet' });
+      }
+    }
+    res.json({ success: true, message: 'Shift berhasil diperbarui' });
+  });
+
+  // --- Announcements API ---
+  app.get('/api/announcements', async (req, res) => {
+    if (doc) {
+      try {
+        const announcements = await getCachedData('announcements', async () => {
+          const sheet = await getOrCreateSheet('Announcements', ['id', 'title', 'content', 'date', 'expiryDate', 'isActive']);
+          if (sheet) {
+            const rows = await sheet.getRows();
+            return rows.map(row => ({
+              id: row.get('id'),
+              title: row.get('title'),
+              content: row.get('content'),
+              date: row.get('date'),
+              expiryDate: row.get('expiryDate'),
+              isActive: String(row.get('isActive')).toLowerCase() === 'true'
+            }));
+          }
+          return [];
+        });
+        return res.json(announcements);
+      } catch (error) {
+        console.error('Error fetching announcements from spreadsheet:', error);
+      }
+    }
+    res.json([]);
+  });
+
+  app.post('/api/announcements', async (req, res) => {
+    const announcement = req.body;
+    if (doc) {
+      try {
+        const sheet = await getOrCreateSheet('Announcements', ['id', 'title', 'content', 'date', 'expiryDate', 'isActive']);
+        if (sheet) {
+          await sheet.addRow({
+            ...announcement,
+            isActive: announcement.isActive.toString(),
+            date: announcement.date || new Date().toISOString().split('T')[0]
+          });
+          delete cache['announcements'];
+        }
+      } catch (error) {
+        console.error('Error saving announcement to spreadsheet:', error);
+        return res.status(500).json({ success: false, message: 'Gagal menyimpan pengumuman' });
+      }
+    }
+    res.json({ success: true, message: 'Pengumuman berhasil ditambahkan' });
+  });
+
+  app.put('/api/announcements/:id', async (req, res) => {
+    const { id } = req.params;
+    const { isActive } = req.body;
+    if (doc) {
+      try {
+        const sheet = await getSheet('Announcements');
+        if (sheet) {
+          const rows = await sheet.getRows();
+          const rowToUpdate = rows.find(r => r.get('id') === id);
+          if (rowToUpdate) {
+            rowToUpdate.set('isActive', isActive.toString());
+            await rowToUpdate.save();
+            delete cache['announcements'];
+          }
+        }
+      } catch (error) {
+        console.error('Error updating announcement:', error);
+        return res.status(500).json({ success: false, message: 'Gagal update pengumuman' });
+      }
+    }
+    res.json({ success: true, message: 'Pengumuman diupdate' });
+  });
+
+  app.delete('/api/announcements/:id', async (req, res) => {
+    const { id } = req.params;
+    if (doc) {
+      try {
+        const sheet = await getSheet('Announcements');
+        if (sheet) {
+          const rows = await sheet.getRows();
+          const rowToDelete = rows.find(r => r.get('id') === id);
+          if (rowToDelete) {
+            await rowToDelete.delete();
+            delete cache['announcements'];
+          }
+        }
+      } catch (error) {
+        console.error('Error deleting announcement:', error);
+        return res.status(500).json({ success: false, message: 'Gagal menghapus pengumuman' });
+      }
+    }
+    res.json({ success: true, message: 'Pengumuman dihapus' });
+  });
+
+  // --- Holidays API ---
+  app.get('/api/holidays', async (req, res) => {
+    if (doc) {
+      try {
+        const items = await getCachedData('holidays', async () => {
+          const sheet = await getOrCreateSheet('Holidays', ['id', 'date', 'name']);
+          if (sheet) {
+            const rows = await sheet.getRows();
+            return rows.map(row => ({
+              id: row.get('id'),
+              date: row.get('date'),
+              name: row.get('name')
+            }));
+          }
+          return [];
+        });
+        return res.json(items);
+      } catch (error) {
+        console.error('Error fetching from spreadsheet:', error);
+      }
+    }
+    res.json([]);
+  });
+
+  app.post('/api/holidays', async (req, res) => {
+    const item = req.body;
+    if (doc) {
+      try {
+        const sheet = await getOrCreateSheet('Holidays', ['id', 'date', 'name']);
+        if (sheet) {
+          await sheet.addRow({
+            id: item.id || Date.now().toString(),
+            date: item.date,
+            name: item.name
+          });
+          delete cache['holidays'];
+          return res.json({ success: true, message: 'Added successfully' });
+        }
+      } catch (error) {
+        console.error('Error adding to spreadsheet:', error);
+        return res.status(500).json({ success: false, message: 'Failed to add item' });
+      }
+    }
+    res.json({ success: false, message: 'No connection' });
+  });
+
+  app.delete('/api/holidays/:id', async (req, res) => {
+    const { id } = req.params;
+    if (doc) {
+      try {
+        const sheet = await getSheet('Holidays');
+        if (sheet) {
+          const rows = await sheet.getRows();
+          const rowToDelete = rows.find(r => r.get('id') === id);
+          if (rowToDelete) {
+            await rowToDelete.delete();
+            delete cache['holidays'];
+            return res.json({ success: true });
+          } else {
+            return res.status(404).json({ success: false });
+          }
+        }
+      } catch (error) {
+        return res.status(500).json({ success: false });
+      }
+    }
+    res.json({ success: false });
+  });
+
+  // --- Settings API ---
+  app.get('/api/settings', async (req, res) => {
+    if (doc) {
+      try {
+        const settingsPayload = await getCachedData('settings', async () => {
+          const sheet = await getOrCreateSheet('Settings', ['key', 'value']);
+          if (sheet) {
+            const rows = await sheet.getRows();
+            const settings: any = {};
+            rows.forEach(row => {
+              try {
+                settings[row.get('key')] = JSON.parse(row.get('value'));
+              } catch (e) {
+                settings[row.get('key')] = row.get('value');
+              }
+            });
+            return settings;
+          }
+          return {};
+        });
+        if (Object.keys(settingsPayload).length > 0) {
+          return res.json(settingsPayload);
+        }
+      } catch (error) {
+        console.error('Error fetching settings from spreadsheet:', error);
+      }
+    }
+    res.json(db.settings);
+  });
+
+  app.post('/api/settings', async (req, res) => {
+    const { key, value } = req.body;
+    db.settings = { ...db.settings, [key]: value };
+    
+    if (doc) {
+      try {
+        const sheet = await getOrCreateSheet('Settings', ['key', 'value']);
+        if (sheet) {
+          const rows = await sheet.getRows();
+          const existingRow = rows.find(r => r.get('key') === key);
+          
+          // Google Sheets cell limit is 50,000 characters.
+          // If value is a large object (like generalSettings with appLogo), we might need to handle it carefully.
+          // For now, we stringify it. If it fails, we catch the error.
+          const stringifiedValue = JSON.stringify(value);
+          
+          if (existingRow) {
+            existingRow.set('value', stringifiedValue);
+            await existingRow.save();
+          } else {
+            await sheet.addRow({ key, value: stringifiedValue });
+          }
+          delete cache['settings'];
+        }
+      } catch (error) {
+        console.error('Error saving settings to spreadsheet:', error);
+        return res.status(500).json({ success: false, message: 'Gagal menyimpan ke spreadsheet. Mungkin ukuran data terlalu besar (misal: gambar logo).' });
+      }
+    }
+    res.json({ success: true, message: 'Pengaturan berhasil disimpan' });
+  });
+
+  app.get('/healthz', (req, res) => {
+    res.status(200).json({ status: 'ok' });
+  });
+
+  // Vite middleware for development
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
@@ -1330,6 +1788,4 @@ async function start() {
   });
 }
 
-start();
-
-export default app;
+startServer();
