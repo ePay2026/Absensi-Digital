@@ -21,8 +21,8 @@ export default defineConfig(({mode}) => {
           enabled: false
         },
         manifest: {
-          name: 'Si Abon Elite App',
-          short_name: 'Si Abon',
+          name: 'Absensi Digital',
+          short_name: 'Absensi',
           theme_color: '#14b8a6',
           display: 'standalone',
           start_url: '/',
