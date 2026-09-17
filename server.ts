@@ -1,5 +1,5 @@
 import path from 'path';
-import app from './src/server/app';
+import app from './src/server/app.js';
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 
