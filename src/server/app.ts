@@ -391,9 +391,9 @@ apiRouter.get('/spreadsheet-status', async (req: Request, res: Response) => {
 
   const envCheck = {
     hasSpreadsheetId: !!spreadsheetId,
-    spreadsheetIdPreview: spreadsheetId ? `${spreadsheetId.substring(0, 8)}...${spreadsheetId.substring(Math.max(0, spreadsheetId.length - 6))}` : null,
+    spreadsheetIdPreview: spreadsheetId ? "************************" : null,
     hasClientEmail: !!clientEmail,
-    clientEmailPreview: clientEmail || null,
+    clientEmailPreview: clientEmail ? "************************" : null,
     hasPrivateKey: !!rawKey,
     privateKeyLength: rawKey.length,
     privateKeyValidPEM: formattedKey.includes('-----BEGIN PRIVATE KEY-----') && formattedKey.includes('-----END PRIVATE KEY-----'),
@@ -421,8 +421,8 @@ apiRouter.get('/spreadsheet-status', async (req: Request, res: Response) => {
     connected: true,
     message: 'Berhasil terhubung ke Google Spreadsheet',
     spreadsheetTitle: doc.title,
-    spreadsheetId,
-    clientEmail,
+    spreadsheetId: spreadsheetId ? "************************" : null,
+    clientEmail: clientEmail ? "************************" : null,
     lastConnected: lastSpreadsheetSuccessTime,
     sheetCount: Object.keys(doc.sheetsByTitle).length,
     sheets: Object.keys(doc.sheetsByTitle),
